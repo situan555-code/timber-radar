@@ -118,8 +118,9 @@ export async function openLidarInspection(map, { parcelId, treeId, treetopProps 
   const { bounds, coords } = resolveInspectionBounds(map, { parcelId, treeId });
   const [west, south, east, north] = bounds;
   const center = { lng: (west + east) / 2, lat: (south + north) / 2 };
+  const framedView = { center, zoom: Math.max(map.getZoom(), treeId ? 18 : 15.5), pitch: 60, bearing: 20 };
 
-  map.easeTo({ center, zoom: Math.max(map.getZoom(), treeId ? 18 : 15.5), pitch: 60, bearing: 20, duration: 700 });
+  map.easeTo({ ...framedView, duration: 700 });
 
   try {
     const mod = await getLidarModule();
@@ -131,6 +132,11 @@ export async function openLidarInspection(map, { parcelId, treeId, treetopProps 
     }
 
     await ctrl.loadPointCloudEptStreaming(EPT_SOURCE_URL, { bounds });
+    // maplibre-gl-lidar auto-frames the camera to the SOURCE's full metadata
+    // bounds on load (the whole USGS acquisition, not our bounded query) --
+    // re-assert our own selected-tree/parcel framing immediately after, so
+    // the library's internal auto-fly never wins the final camera state.
+    map.jumpTo(framedView);
     await new Promise((resolve) => {
       const start = Date.now();
       const poll = () => {
@@ -144,6 +150,7 @@ export async function openLidarInspection(map, { parcelId, treeId, treetopProps 
       setTimeout(poll, 250); // let internal streaming state register before the first check
     });
 
+    map.jumpTo(framedView); // re-assert again after settling, in case the library re-fit mid-stream
     const progress = ctrl.getStreamingProgress() || {};
     showModal(parcelId, treeId, "loaded", { pointCount: progress.loadedPoints ?? 0 });
   } catch (err) {
@@ -182,13 +189,16 @@ function showModal(parcelId, treeId, status, extra = {}) {
 
 function closeLidarInspection(modal) {
   modal.hidden = true;
-  const map = window.__timberRadarMap;
-  if (map && previousCameraState) {
-    map.easeTo({ ...previousCameraState, duration: 600 });
-  }
+  // Unload/stop the point-cloud overlay FIRST -- deck.gl's own render loop
+  // can otherwise keep re-asserting the pitched camera view while it's
+  // still active, fighting a camera reset issued while it's live.
   if (lidarControl && currentCloudId) {
     try { lidarControl.unloadPointCloud(currentCloudId); } catch (e) { /* already gone */ }
     try { lidarControl.stopStreaming(); } catch (e) { /* no-op if already stopped */ }
     currentCloudId = null;
+  }
+  const map = window.__timberRadarMap;
+  if (map && previousCameraState) {
+    map.jumpTo(previousCameraState);
   }
 }
