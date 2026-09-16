@@ -344,7 +344,11 @@ function downloadText(filename, text, mime) {
 }
 
 // --- Map setup ---
+window.__mapLoadFired = false;
+window.__mapLoadError = null;
 map.on("load", () => {
+  window.__mapLoadFired = true;
+  try {
   map.addSource("parcels", { type: "vector", url: `pmtiles://${new URL(PARCELS_PMTILES_URL, location.href)}` });
 
   map.addLayer({
@@ -427,6 +431,10 @@ map.on("load", () => {
     }
   };
   map.on("render", markUsableOnce);
+  } catch (e) {
+    window.__mapLoadError = e;
+    console.error("map load handler error:", e);
+  }
 });
 
 // --- Load attribute index, wire up UI ---
