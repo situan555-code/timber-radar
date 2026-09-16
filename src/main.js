@@ -131,7 +131,10 @@ window.__timberRadarMap = map; // small escape hatch for the lazy-loaded lidar m
 // effect until the lidar module calls it.
 window.__timberRadarSetTerrain = (active) => {
   if (!terrainTilesAvailable) return;
-  map.setTerrain(active ? { source: "terrain-dem", exaggeration: 1.3 } : null);
+  // Exaggeration held at 1.0 (true scale) while terrain/LiDAR/ruler
+  // alignment is being validated -- do not restore a cosmetic
+  // exaggeration until that validation passes (see RESEARCH_DECISIONS.md).
+  map.setTerrain(active ? { source: "terrain-dem", exaggeration: 1.0 } : null);
 };
 
 // Plants/clears the selected-tree height ruler (see the fill-extrusion
@@ -166,6 +169,42 @@ window.__timberRadarSetTreeRuler = (lon, lat, heightM) => {
 window.__timberRadarSetInspectMode = (active) => {
   document.querySelector("#app").classList.toggle("inspect-3d", !!active);
 };
+
+// Elevated crown indicator: the same measured crown polygon, re-extruded
+// to sit as a thin shell near the canopy's real measured top (the top
+// 15% of height_max_ft) instead of on the ground, so the selected crown
+// visually intersects the canopy volume instead of only showing a ground
+// footprint. Derived only from real geometry + height_max_ft.
+window.__timberRadarSetElevatedCrown = (geometry, heightM) => {
+  const src = map.getSource("selected-crown-elevated");
+  if (!src) return;
+  if (!geometry || heightM == null) {
+    src.setData({ type: "FeatureCollection", features: [] });
+    return;
+  }
+  src.setData({
+    type: "FeatureCollection",
+    features: [{ type: "Feature", properties: { base_m: heightM * 0.85, top_m: heightM }, geometry }],
+  });
+};
+
+window.__timberRadarSetDebugBbox = (bounds) => {
+  const src = map.getSource("lidar-debug-bbox");
+  if (!src) return;
+  if (!bounds) {
+    src.setData({ type: "FeatureCollection", features: [] });
+    return;
+  }
+  const [west, south, east, north] = bounds;
+  src.setData({
+    type: "FeatureCollection",
+    features: [{
+      type: "Feature", properties: {},
+      geometry: { type: "Polygon", coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]] },
+    }],
+  });
+};
+
 map.addControl(new maplibregl.NavigationControl(), "top-left");
 
 // --- App state ---
@@ -409,10 +448,37 @@ function hideTreeHoverTooltip() {
   if (tip) tip.hidden = true;
 }
 
-function selectTree(props) {
+// --- Explicit application state machine (2D/3D) ---
+// Prevents the "mixed state" bug where the parcel detail panel, the tree
+// detail panel, and an active 3D LiDAR inspection could all be partially
+// visible/active at once. Exactly one of these is ever true.
+let appState = "PARCEL_2D"; // PARCEL_2D | TREE_2D | TREE_LIDAR_3D
+let lastSelectedTreeProps = null;
+let lastSelectedTreeGeometry = null;
+let lidarModuleRef = null;
+
+async function getLidarModuleRef() {
+  if (!lidarModuleRef) lidarModuleRef = await import("./lidar/lidarInspection.js");
+  return lidarModuleRef;
+}
+
+async function selectTree(props, geometry) {
+  // Defensive guard (item 8): selecting a tree should never be reachable
+  // while a 3D inspection is still active (the crown layer that dispatches
+  // this click is itself hidden during 3D), but if it ever is, fully tear
+  // down the prior 3D session first rather than leaving it running under
+  // a freshly-opened 2D panel.
+  if (appState === "TREE_LIDAR_3D") {
+    const mod = await getLidarModuleRef();
+    mod.closeLidarInspection();
+  }
   selectedTreeId = props.tree_id;
+  lastSelectedTreeProps = props;
+  lastSelectedTreeGeometry = geometry;
+  appState = "TREE_2D";
   if (map.getLayer("tree-crown-selected-outline")) {
     map.setFilter("tree-crown-selected-outline", ["==", ["get", "tree_id"], props.tree_id]);
+    map.setFilter("tree-crown-selected-fill", ["==", ["get", "tree_id"], props.tree_id]);
   }
   openTreeDetailPanel(props);
 }
@@ -453,13 +519,47 @@ function openTreeDetailPanel(props) {
   panel.hidden = false;
 
   if (parcelRow) {
-    document.querySelector("#tree-back-to-parcel").addEventListener("click", () => {
+    document.querySelector("#tree-back-to-parcel").addEventListener("click", async () => {
+      if (appState === "TREE_LIDAR_3D") {
+        const mod = await getLidarModuleRef();
+        mod.closeLidarInspection();
+      }
+      appState = "PARCEL_2D";
       closeTreeDetailPanel();
       selectParcel(parcelId, { fly: false });
     });
   }
   document.querySelector("#tree-inspect-lidar").addEventListener("click", () => {
-    openLidarInspection({ parcelId, treeId: props.tree_id, treetopProps: props });
+    openLidarInspection({ parcelId, treeId: props.tree_id, treetopProps: props, geometry: lastSelectedTreeGeometry });
+  });
+}
+
+function showCompact3DCard(props) {
+  const body = document.querySelector("#tree-detail-body");
+  const parcelId = props.treetop_parcel_id;
+  body.innerHTML = `
+    <div class="compact-3d-card">
+      <div class="detail-title">${props.tree_id}</div>
+      <dl class="detail-metrics compact">
+        <div><dt>Height</dt><dd>${fmt(props.height_max_ft, " ft", 0)}</dd></div>
+        <div><dt>Crown area</dt><dd>${fmt(props.crown_area_sqft, " ft²", 0)}</dd></div>
+        <div><dt>Parcel</dt><dd>${parcelId ?? "—"}</dd></div>
+      </dl>
+      <div class="detail-actions">
+        <button id="lidar-recenter" class="text-button" type="button">Recenter Tree</button>
+        <button id="lidar-back-to-map" class="pill-button" type="button">Back to map</button>
+      </div>
+    </div>
+  `;
+  document.querySelector("#lidar-back-to-map").addEventListener("click", async () => {
+    const mod = await getLidarModuleRef();
+    mod.closeLidarInspection();
+    appState = "TREE_2D";
+    if (lastSelectedTreeProps) openTreeDetailPanel(lastSelectedTreeProps);
+  });
+  document.querySelector("#lidar-recenter").addEventListener("click", async () => {
+    const mod = await getLidarModuleRef();
+    mod.recenterOnTree();
   });
 }
 
@@ -468,13 +568,21 @@ function closeTreeDetailPanel() {
   selectedTreeId = null;
   if (map.getLayer("tree-crown-selected-outline")) {
     map.setFilter("tree-crown-selected-outline", ["==", ["get", "tree_id"], "__none__"]);
+    map.setFilter("tree-crown-selected-fill", ["==", ["get", "tree_id"], "__none__"]);
   }
 }
 
 async function openLidarInspection(target) {
   // Lazy-loaded so the 3D dependency cost is never paid on normal startup.
-  const mod = await import("./lidar/lidarInspection.js");
-  mod.openLidarInspection(map, target);
+  // The compact card must swap in IMMEDIATELY, not after the (multi-
+  // second) point-cloud load completes -- otherwise the full 2D panel
+  // (with its "Back to parcel" button) stays visible for the entire
+  // loading period while the map is already pitched into 3D, which is
+  // exactly the mixed-state bug this state machine exists to prevent.
+  appState = "TREE_LIDAR_3D";
+  showCompact3DCard(target.treetopProps);
+  const mod = await getLidarModuleRef();
+  await mod.openLidarInspection(map, target);
 }
 
 function toggleShortlist(parcelId) {
@@ -713,11 +821,42 @@ map.on("load", () => {
       },
     });
 
+    // Elevated crown indicator: the SAME measured crown polygon, but
+    // extruded to sit near the canopy's real measured top instead of on
+    // the ground -- so the selected crown visually intersects the canopy
+    // volume the LiDAR points occupy, not just its ground footprint.
+    // Derived only from height_max_ft (real data); no fabricated mesh.
+    map.addSource("selected-crown-elevated", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({
+      id: "selected-crown-elevated",
+      type: "fill-extrusion",
+      source: "selected-crown-elevated",
+      paint: {
+        "fill-extrusion-color": "#facc15",
+        "fill-extrusion-opacity": 0.55,
+        "fill-extrusion-base": ["get", "base_m"],
+        "fill-extrusion-height": ["get", "top_m"],
+      },
+    });
+
+    // Debug bbox outline (item 2 in the visual-polish punch list): shows
+    // the exact inspection region the LiDAR loader is clipped to, so the
+    // actual requested/visible region can be checked against the
+    // selected tree by eye. Temporary/diagnostic, not permanent product UI.
+    map.addSource("lidar-debug-bbox", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({
+      id: "lidar-debug-bbox",
+      type: "line",
+      source: "lidar-debug-bbox",
+      paint: { "line-color": "#f472b6", "line-width": 2, "line-dasharray": [2, 1] },
+    });
+
     let hoveredTreeFeatureId = null;
     map.on("click", "tree-crowns-fill", (e) => {
       if (map.getZoom() < CROWNS_INTERACTIVE_MINZOOM) return; // hover/click gated to interactive zoom
       const props = e.features?.[0]?.properties;
-      if (props) selectTree(props);
+      const geometry = e.features?.[0]?.geometry;
+      if (props) selectTree(props, geometry);
     });
     map.on("mouseenter", "tree-crowns-fill", () => {
       if (map.getZoom() >= CROWNS_INTERACTIVE_MINZOOM) map.getCanvas().style.cursor = "pointer";
@@ -855,7 +994,14 @@ document.querySelector("#detail-close").addEventListener("click", () => {
 });
 
 // Tree detail panel close
-document.querySelector("#tree-detail-close").addEventListener("click", closeTreeDetailPanel);
+document.querySelector("#tree-detail-close").addEventListener("click", async () => {
+  if (appState === "TREE_LIDAR_3D") {
+    const mod = await getLidarModuleRef();
+    mod.closeLidarInspection();
+  }
+  appState = "PARCEL_2D";
+  closeTreeDetailPanel();
+});
 
 // Shortlist drawer
 document.querySelector("#shortlist-toggle").addEventListener("click", () => {
