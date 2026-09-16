@@ -163,6 +163,26 @@ body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; 
 
 .maplibregl-popup { display: none; }
 
+.tree-hover-tip {
+  position: fixed; z-index: 30; pointer-events: none;
+  background: rgba(11, 13, 12, 0.92); color: #e5e7eb; border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; line-height: 1.4;
+}
+.tree-hover-tip .muted { color: var(--muted); font-size: 11px; }
+
+.lidar-modal {
+  position: fixed; inset: 0; z-index: 40;
+  background: rgba(5, 6, 6, 0.72);
+  display: flex; align-items: center; justify-content: center;
+}
+.lidar-modal[hidden] { display: none; }
+.lidar-modal-body {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 24px; max-width: 420px; text-align: center;
+}
+.lidar-modal-title { font-weight: 600; font-size: 15px; margin-bottom: 10px; }
+.lidar-modal-note { color: var(--muted); font-size: 13px; line-height: 1.5; margin-bottom: 16px; }
+
 @media (max-width: 900px) {
   /* The topbar wraps to multiple lines at narrow widths (brand + 4 layer
      toggles + shortlist button don't fit one row) -- a fixed 56px grid row

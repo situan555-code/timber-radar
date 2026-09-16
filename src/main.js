@@ -7,6 +7,15 @@ const PARCELS_PMTILES_URL = "./public/data/timber_parcels.pmtiles";
 const CHM_PMTILES_URL = "./public/data/chm.pmtiles";
 const ROADS_URL = "./public/data/roads_aoi.geojson";
 const INDEX_URL = "./public/data/parcels_index.json";
+const TREE_CROWNS_PMTILES_URL = "./public/data/tree_crowns.pmtiles";
+const TREE_TOPS_PMTILES_URL = "./public/data/tree_tops.pmtiles";
+
+// Progressive tree zoom thresholds -- must match config/tree_visualization.yaml's
+// browser.* values (treetops_minzoom, crowns_minzoom, crowns_interactive_minzoom).
+const TREETOPS_MINZOOM = 15;
+const TREETOPS_FADE_ZOOM = 15.5;
+const CROWNS_MINZOOM = 17;
+const CROWNS_INTERACTIVE_MINZOOM = 17;
 
 const SCORE_COLOR_STOPS = [
   0, "#4b5563",   // low
@@ -39,6 +48,23 @@ try {
   console.warn("CHM tiles not available yet:", e);
 }
 
+// Tree crown/treetop tiles are loaded the same optional-availability way as
+// CHM -- normal app startup must not depend on them existing, and (per the
+// 2D performance budget) registering the PMTiles source here does NOT fetch
+// tile bytes; those only start once MapLibre requests a tile inside the
+// layers' own minzoom range, i.e. never on initial low-zoom load.
+let treeTilesAvailable = true;
+try {
+  const crownsPm = new pmtiles.PMTiles(TREE_CROWNS_PMTILES_URL);
+  const topsPm = new pmtiles.PMTiles(TREE_TOPS_PMTILES_URL);
+  pmtilesProtocol.add(crownsPm);
+  pmtilesProtocol.add(topsPm);
+  await Promise.all([crownsPm.getHeader(), topsPm.getHeader()]);
+} catch (e) {
+  treeTilesAvailable = false;
+  console.warn("Tree crown/treetop tiles not available yet:", e);
+}
+
 const map = new maplibregl.Map({
   container: "map",
   center: [(AOI_BBOX[0] + AOI_BBOX[2]) / 2, (AOI_BBOX[1] + AOI_BBOX[3]) / 2],
@@ -57,6 +83,7 @@ const map = new maplibregl.Map({
   },
 });
 map.fitBounds(AOI_BBOX, { padding: 24, duration: 0 });
+window.__timberRadarMap = map; // small escape hatch for the lazy-loaded lidar module
 map.addControl(new maplibregl.NavigationControl(), "top-left");
 
 // --- App state ---
@@ -276,6 +303,98 @@ function openDetailPanel(row) {
   });
 }
 
+// --- Tree crown selection/hover/detail (progressive disclosure below parcel level) ---
+let selectedTreeId = null;
+
+function showTreeHoverTooltip(e, props) {
+  let tip = document.querySelector("#tree-hover-tip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "tree-hover-tip";
+    tip.className = "tree-hover-tip";
+    document.body.appendChild(tip);
+  }
+  const heightFt = Number(props.height_max_ft);
+  const areaFt = Number(props.crown_area_sqft);
+  tip.innerHTML = Number.isFinite(heightFt) ? `${heightFt.toFixed(0)} ft` : "—";
+  if (Number.isFinite(areaFt)) tip.innerHTML += `<br/><span class="muted">${areaFt.toFixed(0)} ft² crown</span>`;
+  tip.style.left = `${e.point.x + 12}px`;
+  tip.style.top = `${e.point.y + 12}px`;
+  tip.hidden = false;
+}
+function hideTreeHoverTooltip() {
+  const tip = document.querySelector("#tree-hover-tip");
+  if (tip) tip.hidden = true;
+}
+
+function selectTree(props) {
+  selectedTreeId = props.tree_id;
+  if (map.getLayer("tree-crown-selected-outline")) {
+    map.setFilter("tree-crown-selected-outline", ["==", ["get", "tree_id"], props.tree_id]);
+  }
+  openTreeDetailPanel(props);
+}
+
+function openTreeDetailPanel(props) {
+  const panel = document.querySelector("#tree-detail-panel");
+  const body = document.querySelector("#tree-detail-body");
+  const parcelId = props.treetop_parcel_id;
+  const parcelRow = parcelId ? indexById.get(parcelId) : null;
+  const flags = (props.quality_flags_flat || "").split(",").filter(Boolean);
+
+  body.innerHTML = `
+    <div class="detail-title">DETECTED CROWN</div>
+    <div class="detail-sub">${props.tree_id}</div>
+
+    <dl class="detail-metrics">
+      <div><dt>Estimated height</dt><dd>${fmt(props.height_max_ft, " ft", 0)}</dd></div>
+      <div><dt>Height p90</dt><dd>${fmt(props.height_p90_ft, " ft", 0)}</dd></div>
+      <div><dt>Crown area</dt><dd>${fmt(props.crown_area_sqft, " ft²", 0)}</dd></div>
+      <div><dt>Equivalent crown diameter</dt><dd>${fmt(props.crown_equivalent_diameter_ft, " ft", 0)}</dd></div>
+      <div><dt>Parcel</dt><dd>${parcelId ?? "—"}</dd></div>
+      <div><dt>Detection</dt><dd>LiDAR CHM</dd></div>
+      <div><dt>Version</dt><dd>${props.segmentation_version ?? "—"}</dd></div>
+      <div><dt>Quality flags</dt><dd>${flags.length ? flags.join(", ") : "None"}</dd></div>
+    </dl>
+
+    <div class="coverage-note">
+      Species: Not estimated<br/>
+      DBH: Not estimated<br/>
+      Timber volume: Not estimated
+    </div>
+
+    <div class="detail-actions">
+      ${parcelRow ? `<button id="tree-back-to-parcel" class="text-button" type="button">Back to parcel ${parcelId}</button>` : ""}
+      <button id="tree-inspect-lidar" class="pill-button" type="button">Inspect LiDAR in 3D</button>
+    </div>
+  `;
+  panel.hidden = false;
+
+  if (parcelRow) {
+    document.querySelector("#tree-back-to-parcel").addEventListener("click", () => {
+      closeTreeDetailPanel();
+      selectParcel(parcelId, { fly: false });
+    });
+  }
+  document.querySelector("#tree-inspect-lidar").addEventListener("click", () => {
+    openLidarInspection({ parcelId, treeId: props.tree_id, treetopProps: props });
+  });
+}
+
+function closeTreeDetailPanel() {
+  document.querySelector("#tree-detail-panel").hidden = true;
+  selectedTreeId = null;
+  if (map.getLayer("tree-crown-selected-outline")) {
+    map.setFilter("tree-crown-selected-outline", ["==", ["get", "tree_id"], "__none__"]);
+  }
+}
+
+async function openLidarInspection(target) {
+  // Lazy-loaded so the 3D dependency cost is never paid on normal startup.
+  const mod = await import("./lidar/lidarInspection.js");
+  mod.openLidarInspection(map, target);
+}
+
 function toggleShortlist(parcelId) {
   if (shortlist.has(parcelId)) shortlist.delete(parcelId);
   else shortlist.add(parcelId);
@@ -415,6 +534,79 @@ map.on("load", () => {
   map.on("mouseenter", "parcel-fill", () => (map.getCanvas().style.cursor = "pointer"));
   map.on("mouseleave", "parcel-fill", () => (map.getCanvas().style.cursor = ""));
 
+  if (treeTilesAvailable) {
+    map.addSource("tree-crowns", { type: "vector", url: `pmtiles://${new URL(TREE_CROWNS_PMTILES_URL, location.href)}` });
+    map.addSource("tree-tops", { type: "vector", url: `pmtiles://${new URL(TREE_TOPS_PMTILES_URL, location.href)}` });
+
+    // Treetops: small restrained circles, fading in starting just below
+    // their minzoom so they don't pop in abruptly.
+    map.addLayer({
+      id: "tree-tops-circle",
+      type: "circle",
+      source: "tree-tops",
+      "source-layer": "tree_tops",
+      minzoom: TREETOPS_MINZOOM,
+      paint: {
+        "circle-radius": 2.2,
+        "circle-color": "#a3e635",
+        "circle-opacity": ["interpolate", ["linear"], ["zoom"], TREETOPS_FADE_ZOOM, 0, TREETOPS_FADE_ZOOM + 0.5, 0.55, CROWNS_MINZOOM + 0.75, 0.35],
+      },
+    });
+
+    // Crowns: transparent fill + thin neutral outline by default; no
+    // full-rainbow heatmap (that's what the CHM analytical layer is for).
+    map.addLayer({
+      id: "tree-crowns-fill",
+      type: "fill",
+      source: "tree-crowns",
+      "source-layer": "tree_crowns",
+      minzoom: CROWNS_MINZOOM,
+      paint: {
+        "fill-color": "#86efac",
+        "fill-opacity": ["interpolate", ["linear"], ["zoom"], CROWNS_MINZOOM, 0, CROWNS_MINZOOM + 0.5, 0.12, 19, 0.22],
+      },
+    });
+    map.addLayer({
+      id: "tree-crowns-outline",
+      type: "line",
+      source: "tree-crowns",
+      "source-layer": "tree_crowns",
+      minzoom: CROWNS_MINZOOM,
+      paint: {
+        "line-color": "#d9f99d",
+        "line-width": 0.6,
+        "line-opacity": ["interpolate", ["linear"], ["zoom"], CROWNS_MINZOOM, 0, CROWNS_MINZOOM + 0.5, 0.5, 19, 0.85],
+      },
+    });
+    map.addLayer({
+      id: "tree-crown-selected-outline",
+      type: "line",
+      source: "tree-crowns",
+      "source-layer": "tree_crowns",
+      filter: ["==", ["get", "tree_id"], "__none__"],
+      paint: { "line-color": "#facc15", "line-width": 2.5 },
+    });
+
+    map.on("click", "tree-crowns-fill", (e) => {
+      if (map.getZoom() < CROWNS_INTERACTIVE_MINZOOM) return; // hover/click gated to interactive zoom
+      const props = e.features?.[0]?.properties;
+      if (props) selectTree(props);
+    });
+    map.on("mouseenter", "tree-crowns-fill", () => {
+      if (map.getZoom() >= CROWNS_INTERACTIVE_MINZOOM) map.getCanvas().style.cursor = "pointer";
+    });
+    map.on("mouseleave", "tree-crowns-fill", () => (map.getCanvas().style.cursor = ""));
+
+    map.on("mousemove", "tree-crowns-fill", (e) => {
+      if (map.getZoom() < CROWNS_INTERACTIVE_MINZOOM) return;
+      const props = e.features?.[0]?.properties;
+      if (props) showTreeHoverTooltip(e, props);
+    });
+    map.on("mouseleave", "tree-crowns-fill", hideTreeHoverTooltip);
+  } else {
+    console.warn("Tree crown/treetop layers not added -- PMTiles unavailable.");
+  }
+
   // E05.10.B timing: first idle after style/sources settle, and first
   // render with the parcel-fill layer actually painting features (not
   // just an empty/not-yet-loaded tile).
@@ -506,6 +698,9 @@ document.querySelector("#detail-close").addEventListener("click", () => {
   document.querySelectorAll(".result-row.selected").forEach((el) => el.classList.remove("selected"));
   if (map.getLayer("parcel-selected-outline")) map.setFilter("parcel-selected-outline", ["==", ["get", "parcel_id"], "__none__"]);
 });
+
+// Tree detail panel close
+document.querySelector("#tree-detail-close").addEventListener("click", closeTreeDetailPanel);
 
 // Shortlist drawer
 document.querySelector("#shortlist-toggle").addEventListener("click", () => {

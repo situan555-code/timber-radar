@@ -1,0 +1,25 @@
+{
+  "crown_allowlist": [
+    "tree_id",
+    "treetop_parcel_id",
+    "height_max_ft",
+    "height_p90_ft",
+    "crown_area_sqft",
+    "crown_equivalent_diameter_ft",
+    "segmentation_version",
+    "boundary_touching",
+    "quality_flags_flat"
+  ],
+  "crown_count": 447646,
+  "crowns_maxzoom": 17,
+  "crowns_minzoom": 17,
+  "segmentation_version": "tree_chm_v1",
+  "tree_crowns_pmtiles": "web/public/data/tree_crowns.pmtiles",
+  "tree_tops_pmtiles": "web/public/data/tree_tops.pmtiles",
+  "treetop_allowlist": [
+    "tree_id",
+    "treetop_parcel_id"
+  ],
+  "treetop_count": 447646,
+  "treetops_minzoom": 15
+}
