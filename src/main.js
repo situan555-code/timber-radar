@@ -65,10 +65,17 @@ try {
   console.warn("Tree crown/treetop tiles not available yet:", e);
 }
 
+// High-zoom imagery: Esri World Imagery is a free, no-account, no-API-key
+// public tile service (used broadly by open-source map projects for this
+// exact purpose). Detected crowns are the intended hero at high zoom, and
+// real aerial context reads far better under them than flat cartography.
+const IMAGERY_MINZOOM = 15;
+
 const map = new maplibregl.Map({
   container: "map",
   center: [(AOI_BBOX[0] + AOI_BBOX[2]) / 2, (AOI_BBOX[1] + AOI_BBOX[3]) / 2],
   zoom: 11,
+  maxPitch: 75, // default 60 is too shallow for the 3D LiDAR inspection view's intended oblique relief
   style: {
     version: 8,
     sources: {
@@ -78,8 +85,18 @@ const map = new maplibregl.Map({
         tileSize: 256,
         attribution: "© OpenStreetMap contributors",
       },
+      satellite: {
+        type: "raster",
+        tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+        tileSize: 256,
+        attribution: "Esri, Maxar, Earthstar Geographics",
+        maxzoom: 19,
+      },
     },
-    layers: [{ id: "osm", type: "raster", source: "osm" }],
+    layers: [
+      { id: "osm", type: "raster", source: "osm" },
+      { id: "satellite", type: "raster", source: "satellite", layout: { visibility: "none" } },
+    ],
   },
 });
 map.fitBounds(AOI_BBOX, { padding: 24, duration: 0 });
@@ -471,7 +488,14 @@ map.on("load", () => {
     type: "fill",
     source: "parcels",
     "source-layer": "timber_parcels",
-    paint: { "fill-color": scoreColorExpression(), "fill-opacity": 0.62 },
+    paint: {
+      "fill-color": scoreColorExpression(),
+      // The opportunity-score heatmap is the right identity at regional/
+      // ranking zoom, but at high zoom detected crowns (+ real aerial
+      // imagery) become the hero -- fade the score fill down instead of
+      // letting it visually compete with individual crowns.
+      "fill-opacity": ["interpolate", ["linear"], ["zoom"], 11, 0.62, 15, 0.55, 17, 0.12],
+    },
   });
   // line-dasharray does not support data-driven (per-feature) expressions
   // in MapLibre, so "solid outline = full coverage, dashed = provisional"
@@ -553,8 +577,10 @@ map.on("load", () => {
       },
     });
 
-    // Crowns: transparent fill + thin neutral outline by default; no
-    // full-rainbow heatmap (that's what the CHM analytical layer is for).
+    // Crowns are the high-zoom hero layer: subtle/near-transparent by
+    // default (real aerial imagery shows through), brighten distinctly on
+    // hover, and the selected crown/treetop dominates everything else --
+    // deliberately NOT the green/yellow/red opportunity-score heatmap look.
     map.addLayer({
       id: "tree-crowns-fill",
       type: "fill",
@@ -562,8 +588,12 @@ map.on("load", () => {
       "source-layer": "tree_crowns",
       minzoom: CROWNS_MINZOOM,
       paint: {
-        "fill-color": "#86efac",
-        "fill-opacity": ["interpolate", ["linear"], ["zoom"], CROWNS_MINZOOM, 0, CROWNS_MINZOOM + 0.5, 0.12, 19, 0.22],
+        "fill-color": "#eab308",
+        "fill-opacity": [
+          "interpolate", ["linear"], ["zoom"],
+          CROWNS_MINZOOM, 0,
+          CROWNS_MINZOOM + 0.5, ["case", ["boolean", ["feature-state", "hover"], false], 0.30, 0.08],
+        ],
       },
     });
     map.addLayer({
@@ -573,9 +603,13 @@ map.on("load", () => {
       "source-layer": "tree_crowns",
       minzoom: CROWNS_MINZOOM,
       paint: {
-        "line-color": "#d9f99d",
-        "line-width": 0.6,
-        "line-opacity": ["interpolate", ["linear"], ["zoom"], CROWNS_MINZOOM, 0, CROWNS_MINZOOM + 0.5, 0.5, 19, 0.85],
+        "line-color": ["case", ["boolean", ["feature-state", "hover"], false], "#fde68a", "#f8fafc"],
+        "line-width": ["case", ["boolean", ["feature-state", "hover"], false], 1.6, 0.5],
+        "line-opacity": [
+          "interpolate", ["linear"], ["zoom"],
+          CROWNS_MINZOOM, 0,
+          CROWNS_MINZOOM + 0.5, ["case", ["boolean", ["feature-state", "hover"], false], 0.95, 0.45],
+        ],
       },
     });
     map.addLayer({
@@ -584,9 +618,18 @@ map.on("load", () => {
       source: "tree-crowns",
       "source-layer": "tree_crowns",
       filter: ["==", ["get", "tree_id"], "__none__"],
-      paint: { "line-color": "#facc15", "line-width": 2.5 },
+      paint: { "line-color": "#facc15", "line-width": 3.5, "line-opacity": 1 },
+    });
+    map.addLayer({
+      id: "tree-crown-selected-fill",
+      type: "fill",
+      source: "tree-crowns",
+      "source-layer": "tree_crowns",
+      filter: ["==", ["get", "tree_id"], "__none__"],
+      paint: { "fill-color": "#facc15", "fill-opacity": 0.28 },
     });
 
+    let hoveredTreeFeatureId = null;
     map.on("click", "tree-crowns-fill", (e) => {
       if (map.getZoom() < CROWNS_INTERACTIVE_MINZOOM) return; // hover/click gated to interactive zoom
       const props = e.features?.[0]?.properties;
@@ -595,17 +638,45 @@ map.on("load", () => {
     map.on("mouseenter", "tree-crowns-fill", () => {
       if (map.getZoom() >= CROWNS_INTERACTIVE_MINZOOM) map.getCanvas().style.cursor = "pointer";
     });
-    map.on("mouseleave", "tree-crowns-fill", () => (map.getCanvas().style.cursor = ""));
+    map.on("mouseleave", "tree-crowns-fill", () => {
+      map.getCanvas().style.cursor = "";
+      if (hoveredTreeFeatureId !== null) {
+        map.setFeatureState({ source: "tree-crowns", sourceLayer: "tree_crowns", id: hoveredTreeFeatureId }, { hover: false });
+        hoveredTreeFeatureId = null;
+      }
+    });
 
     map.on("mousemove", "tree-crowns-fill", (e) => {
       if (map.getZoom() < CROWNS_INTERACTIVE_MINZOOM) return;
-      const props = e.features?.[0]?.properties;
-      if (props) showTreeHoverTooltip(e, props);
+      const feature = e.features?.[0];
+      if (!feature) return;
+      if (hoveredTreeFeatureId !== feature.id) {
+        if (hoveredTreeFeatureId !== null) {
+          map.setFeatureState({ source: "tree-crowns", sourceLayer: "tree_crowns", id: hoveredTreeFeatureId }, { hover: false });
+        }
+        hoveredTreeFeatureId = feature.id;
+        map.setFeatureState({ source: "tree-crowns", sourceLayer: "tree_crowns", id: hoveredTreeFeatureId }, { hover: true });
+      }
+      showTreeHoverTooltip(e, feature.properties);
     });
     map.on("mouseleave", "tree-crowns-fill", hideTreeHoverTooltip);
   } else {
     console.warn("Tree crown/treetop layers not added -- PMTiles unavailable.");
   }
+
+  // Aerial imagery at high zoom, cartographic basemap otherwise -- a
+  // simple crossfade on the "zoom" event (no extra tile fetches beyond
+  // the two raster sources already registered).
+  let imageryActive = false;
+  const updateBasemap = () => {
+    const wantImagery = map.getZoom() >= IMAGERY_MINZOOM;
+    if (wantImagery === imageryActive) return;
+    imageryActive = wantImagery;
+    map.setLayoutProperty("satellite", "visibility", wantImagery ? "visible" : "none");
+    map.setLayoutProperty("osm", "visibility", wantImagery ? "none" : "visible");
+  };
+  map.on("zoom", updateBasemap);
+  updateBasemap();
 
   // E05.10.B timing: first idle after style/sources settle, and first
   // render with the parcel-fill layer actually painting features (not
