@@ -82,8 +82,23 @@ function getOrCreateControl(map, mod, pointBudget) {
   // classification toggles, layer list, etc.) -- none of that belongs in
   // the Timber Radar product surface. Timber Radar exposes only the
   // corner status badge + the Canopy/Height/Classified mode strip.
-  const container = lidarControl.getContainer?.();
-  if (container) container.style.display = "none";
+  // getContainer() returns the small top-right control-corner element,
+  // but the library's actual full panel (color/point-size/opacity/3D
+  // terrain/metadata UI) renders as its own floating element elsewhere in
+  // the DOM ("lidar-control-panel"), NOT nested inside that container --
+  // hiding only the container left the real panel fully visible in
+  // production. Hide both, and re-assert after the panel exists (its
+  // first real DOM insertion can happen asynchronously after the control
+  // is added).
+  const hidePanel = () => {
+    const container = lidarControl.getContainer?.();
+    if (container) container.style.display = "none";
+    const panel = lidarControl.getPanelElement?.();
+    if (panel) panel.style.display = "none";
+  };
+  hidePanel();
+  setTimeout(hidePanel, 300);
+  setTimeout(hidePanel, 1000);
   return lidarControl;
 }
 
