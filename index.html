@@ -76,6 +76,12 @@
       <div id="tree-detail-body"></div>
     </div>
 
+    <div id="lidar-mode-strip" class="lidar-mode-strip" hidden>
+      <button type="button" data-mode="canopy" class="lidar-mode-btn active">Canopy</button>
+      <button type="button" data-mode="height" class="lidar-mode-btn">Height</button>
+      <button type="button" data-mode="classified" class="lidar-mode-btn">Classified</button>
+    </div>
+
     <div id="shortlist-drawer" class="overlay-panel" hidden>
       <div class="drawer-header">
         <span>Shortlist</span>
@@ -91,6 +97,6 @@
 
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
-  <script type="module" src="./src/main.js?verify=uxpolish1"></script>
+  <script type="module" src="./src/main.js"></script>
 </body>
 </html>

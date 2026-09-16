@@ -9,6 +9,7 @@ const ROADS_URL = "./public/data/roads_aoi.geojson";
 const INDEX_URL = "./public/data/parcels_index.json";
 const TREE_CROWNS_PMTILES_URL = "./public/data/tree_crowns.pmtiles";
 const TREE_TOPS_PMTILES_URL = "./public/data/tree_tops.pmtiles";
+const TERRAIN_PMTILES_URL = "./public/data/terrain.pmtiles";
 
 // Progressive tree zoom thresholds -- must match config/tree_visualization.yaml's
 // browser.* values (treetops_minzoom, crowns_minzoom, crowns_interactive_minzoom).
@@ -65,6 +66,19 @@ try {
   console.warn("Tree crown/treetop tiles not available yet:", e);
 }
 
+// Real terrain (Terrarium-encoded DTM derivative, same LiDAR acquisition
+// as the CHM/point cloud) -- lets the 3D inspection view drape the aerial
+// photo over true relief instead of a flat pitched plane.
+let terrainTilesAvailable = true;
+try {
+  const terrainPm = new pmtiles.PMTiles(TERRAIN_PMTILES_URL);
+  pmtilesProtocol.add(terrainPm);
+  await terrainPm.getHeader();
+} catch (e) {
+  terrainTilesAvailable = false;
+  console.warn("Terrain tiles not available yet:", e);
+}
+
 // High-zoom imagery: Esri World Imagery is a free, no-account, no-API-key
 // public tile service (used broadly by open-source map projects for this
 // exact purpose). Detected crowns are the intended hero at high zoom, and
@@ -92,6 +106,16 @@ const map = new maplibregl.Map({
         attribution: "Esri, Maxar, Earthstar Geographics",
         maxzoom: 19,
       },
+      ...(terrainTilesAvailable
+        ? {
+            "terrain-dem": {
+              type: "raster-dem",
+              url: `pmtiles://${new URL(TERRAIN_PMTILES_URL, location.href)}`,
+              tileSize: 256,
+              encoding: "terrarium",
+            },
+          }
+        : {}),
     },
     layers: [
       { id: "osm", type: "raster", source: "osm" },
@@ -101,6 +125,47 @@ const map = new maplibregl.Map({
 });
 map.fitBounds(AOI_BBOX, { padding: 24, duration: 0 });
 window.__timberRadarMap = map; // small escape hatch for the lazy-loaded lidar module
+
+// Real terrain drape (Terrarium DEM), toggled on only while 3D inspection
+// is active -- the 2D map stays flat (pitch 0) so this normally has no
+// effect until the lidar module calls it.
+window.__timberRadarSetTerrain = (active) => {
+  if (!terrainTilesAvailable) return;
+  map.setTerrain(active ? { source: "terrain-dem", exaggeration: 1.3 } : null);
+};
+
+// Plants/clears the selected-tree height ruler (see the fill-extrusion
+// layer above). heightM is the real measured height_max_ft converted to
+// meters -- never fabricated.
+window.__timberRadarSetTreeRuler = (lon, lat, heightM) => {
+  const src = map.getSource("selected-tree-ruler");
+  if (!src) return;
+  if (lon == null || lat == null || heightM == null) {
+    src.setData({ type: "FeatureCollection", features: [] });
+    return;
+  }
+  const halfSide = 0.0000015; // ~0.17m half-side square footprint -- a visible pole, not a fabricated canopy shape
+  src.setData({
+    type: "FeatureCollection",
+    features: [{
+      type: "Feature",
+      properties: { height_m: heightM },
+      geometry: {
+        type: "Polygon",
+        coordinates: [[
+          [lon - halfSide, lat - halfSide], [lon + halfSide, lat - halfSide],
+          [lon + halfSide, lat + halfSide], [lon - halfSide, lat + halfSide],
+          [lon - halfSide, lat - halfSide],
+        ]],
+      },
+    }],
+  });
+};
+
+// Enter/exit the collapsed-sidebar "Inspect Tree" mode.
+window.__timberRadarSetInspectMode = (active) => {
+  document.querySelector("#app").classList.toggle("inspect-3d", !!active);
+};
 map.addControl(new maplibregl.NavigationControl(), "top-left");
 
 // --- App state ---
@@ -494,7 +559,7 @@ map.on("load", () => {
       // ranking zoom, but at high zoom detected crowns (+ real aerial
       // imagery) become the hero -- fade the score fill down instead of
       // letting it visually compete with individual crowns.
-      "fill-opacity": ["interpolate", ["linear"], ["zoom"], 11, 0.62, 15, 0.55, 17, 0.12],
+      "fill-opacity": ["interpolate", ["linear"], ["zoom"], 11, 0.62, 15, 0.5, 16.5, 0.15, 17, 0],
     },
   });
   // line-dasharray does not support data-driven (per-feature) expressions
@@ -627,6 +692,25 @@ map.on("load", () => {
       "source-layer": "tree_crowns",
       filter: ["==", ["get", "tree_id"], "__none__"],
       paint: { "fill-color": "#facc15", "fill-opacity": 0.28 },
+    });
+
+    // Selected-tree height ruler: a small fill-extrusion "pole" planted at
+    // the canonical treetop position, extruded to the tree's real measured
+    // height. Renders via MapLibre's own pitched 3D (not the deck.gl
+    // overlay), giving an unmistakable, data-grounded spatial anchor for
+    // the selected tree during 3D inspection -- not a fabricated 3D tree
+    // model, just the actual height_max_ft value as a visible ruler.
+    map.addSource("selected-tree-ruler", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({
+      id: "selected-tree-ruler",
+      type: "fill-extrusion",
+      source: "selected-tree-ruler",
+      paint: {
+        "fill-extrusion-color": "#22d3ee",
+        "fill-extrusion-opacity": 0.9,
+        "fill-extrusion-height": ["get", "height_m"],
+        "fill-extrusion-base": 0,
+      },
     });
 
     let hoveredTreeFeatureId = null;

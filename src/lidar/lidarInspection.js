@@ -4,9 +4,15 @@
 //
 // Renderer: maplibre-gl-lidar (EPT streaming via deck.gl), loaded from
 // esm.sh at first use. Source: the SAME public USGS 3DEP EPT acquisition
-// (OH_Statewide_Phase2_6_2020) already used by the analysis pipeline --
-// verified working via bounded streaming reads. COPC fallback not needed
-// (EPT passed on first attempt).
+// (OH_Statewide_Phase2_6_2020) already used by the analysis pipeline.
+//
+// Alignment note (verified 2026-09-16, scripts/audit_3d_alignment.py): an
+// independent bounded PDAL read at the canonical treetop position agreed
+// with the CHM/DTM-derived height to within 0.00m. The LiDAR data itself
+// is correctly georeferenced -- the "slab"/misalignment appearance this
+// module previously had was a display/fusion problem (unhonored `bounds`
+// streaming option, viewport-driven node selection, vertical
+// auto-normalization against a flat basemap), not a data problem.
 
 const LIDAR_MODULE_URL = "https://esm.sh/maplibre-gl-lidar@0.17.0";
 const EPT_SOURCE_URL = "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/OH_Statewide_Phase2_6_2020/ept.json";
@@ -15,6 +21,7 @@ const TREE_POINT_BUDGET_MOBILE = 120_000;
 const PARCEL_POINT_BUDGET_DESKTOP = 2_000_000;
 const PARCEL_POINT_BUDGET_MOBILE = 400_000;
 const PARCEL_MARGIN_M = 20;
+const TREE_CONTEXT_MARGIN_M = 30; // "crown + 20-40m context" per instruction
 const MOBILE_WIDTH_BREAKPOINT = 700;
 
 // Layers hidden while 3D inspection is active -- the point cloud is the
@@ -30,6 +37,9 @@ let lidarControl = null;
 let previousCameraState = null;
 let currentCloudId = null;
 let suppressedLayerPriorVisibility = null;
+let currentMode = "canopy";
+let lastGroundEstimateM = null;
+let lastTopEstimateM = null;
 
 function isMobileWidth() {
   return window.innerWidth < MOBILE_WIDTH_BREAKPOINT;
@@ -52,34 +62,28 @@ function getOrCreateControl(map, mod, pointBudget) {
   }
   lidarControl = new mod.LidarControl({
     pointBudget,
-    // Narrow percentile range + a restrained terrain palette so tall
-    // canopy separates clearly from ground/low vegetation instead of
-    // reading as one continuous colored carpet.
     colorRange: { mode: "percentile", percentileLow: 5, percentileHigh: 95 },
-    // CRITICAL: the library's own autoZoom calls map.fitBounds() to the
-    // EPT SOURCE's full dataset bounds (the whole USGS acquisition), not
-    // our bounded query -- and any camera change after streaming starts
-    // (including our own corrective jumpTo/easeTo) resets its adaptive
-    // viewport-driven streaming manager, wiping out already-rendered
-    // points. Disabling autoZoom and never touching the camera again
-    // after the load call is what actually fixes both the wrong-location
-    // framing bug AND makes the point cloud render at all.
+    // See the top-of-file alignment note: autoZoom fits the camera to the
+    // EPT source's FULL dataset bounds (not our query), and any camera
+    // change after streaming starts resets the adaptive streaming
+    // manager and stops new points loading. Disabling it and never
+    // touching the camera again after load is what makes points load AND
+    // land in the right place.
     autoZoom: false,
+    // Now that real terrain is available (map.setTerrain), render points
+    // at their true absolute elevation instead of the library's default
+    // "shift minimum toward zero" normalization, so the cloud can visibly
+    // sit on/grow out of the terrain-draped basemap rather than floating
+    // at an arbitrary height above it.
+    autoZOffset: false,
   });
   map.addControl(lidarControl, "top-right");
   // The library ships its own full generic panel (metadata, cross-section,
   // classification toggles, layer list, etc.) -- none of that belongs in
-  // the Timber Radar product surface, so it's hidden entirely; the small
-  // status badge below is the only 3D UI the product exposes.
+  // the Timber Radar product surface. Timber Radar exposes only the
+  // corner status badge + the Canopy/Height/Classified mode strip.
   const container = lidarControl.getContainer?.();
   if (container) container.style.display = "none";
-  try {
-    lidarControl.setColorScheme("elevation");
-    lidarControl.setColormap("terrain");
-    lidarControl.setPointSize?.(1.5);
-  } catch (e) {
-    console.warn("LiDAR color/point styling not applied:", e);
-  }
   return lidarControl;
 }
 
@@ -108,18 +112,10 @@ function metersToDegreesLon(m, atLat) {
   return m / (111320 * Math.cos((atLat * Math.PI) / 180));
 }
 
-function bboxFromCoords(coords, marginM) {
-  let west = Infinity, south = Infinity, east = -Infinity, north = -Infinity;
-  for (const [lon, lat] of coords) {
-    west = Math.min(west, lon);
-    east = Math.max(east, lon);
-    south = Math.min(south, lat);
-    north = Math.max(north, lat);
-  }
-  const midLat = (south + north) / 2;
-  const dLon = metersToDegreesLon(marginM, midLat);
+function bboxAround(lon, lat, marginM) {
+  const dLon = metersToDegreesLon(marginM, lat);
   const dLat = metersToDegreesLat(marginM);
-  return [west - dLon, south - dLat, east + dLon, north + dLat];
+  return [lon - dLon, lat - dLat, lon + dLon, lat + dLat];
 }
 
 function flattenCoords(geometry) {
@@ -128,29 +124,40 @@ function flattenCoords(geometry) {
   return [];
 }
 
-function resolveInspectionBounds(map, { parcelId, treeId }) {
-  if (treeId) {
-    const feature = map.queryRenderedFeatures({ layers: ["tree-crowns-fill"] }).find((f) => f.properties.tree_id === treeId);
-    if (feature) {
-      const coords = flattenCoords(feature.geometry);
-      if (coords.length) return { bounds: bboxFromCoords(coords, PARCEL_MARGIN_M), coords };
-    }
+function resolveInspectionAnchor(map, { parcelId, treeId, treetopProps }) {
+  // The canonical treetop_lon/treetop_lat (added to the tile allowlist
+  // specifically for this) is the authoritative 3D anchor -- NOT a
+  // centroid derived from vector-tile crown geometry, which tippecanoe
+  // can clip/simplify away from the true position.
+  if (treeId && treetopProps?.treetop_lon != null && treetopProps?.treetop_lat != null) {
+    return {
+      lon: treetopProps.treetop_lon,
+      lat: treetopProps.treetop_lat,
+      bounds: bboxAround(treetopProps.treetop_lon, treetopProps.treetop_lat, TREE_CONTEXT_MARGIN_M),
+    };
   }
   if (parcelId) {
     const feature = map.queryRenderedFeatures({ layers: ["parcel-fill"] }).find((f) => f.properties.parcel_id === parcelId);
     if (feature) {
       const coords = flattenCoords(feature.geometry);
-      if (coords.length) return { bounds: bboxFromCoords(coords, PARCEL_MARGIN_M), coords };
+      if (coords.length) {
+        const lon = coords.reduce((s, c) => s + c[0], 0) / coords.length;
+        const lat = coords.reduce((s, c) => s + c[1], 0) / coords.length;
+        let west = Infinity, south = Infinity, east = -Infinity, north = -Infinity;
+        for (const [x, y] of coords) { west = Math.min(west, x); east = Math.max(east, x); south = Math.min(south, y); north = Math.max(north, y); }
+        const dLon = metersToDegreesLon(PARCEL_MARGIN_M, lat);
+        const dLat = metersToDegreesLat(PARCEL_MARGIN_M);
+        return { lon, lat, bounds: [west - dLon, south - dLat, east + dLon, north + dLat] };
+      }
     }
   }
-  // Fallback: a small bounded window around the current map center -- never
-  // the full AOI/dataset.
   const c = map.getCenter();
-  return { bounds: bboxFromCoords([[c.lng, c.lat]], 150), coords: null };
+  return { lon: c.lng, lat: c.lat, bounds: bboxAround(c.lng, c.lat, 150) };
 }
 
 export async function openLidarInspection(map, { parcelId, treeId, treetopProps }) {
   showStatusBadge("loading", { treeId, parcelId });
+  window.__timberRadarSetInspectMode?.(true);
 
   previousCameraState = {
     center: map.getCenter(),
@@ -161,17 +168,43 @@ export async function openLidarInspection(map, { parcelId, treeId, treetopProps 
 
   suppressAnalyticalLayers(map);
 
-  const { bounds } = resolveInspectionBounds(map, { parcelId, treeId });
-  const [west, south, east, north] = bounds;
-  const center = { lng: (west + east) / 2, lat: (south + north) / 2 };
-  // Oblique, clearly-tilted camera with real vertical relief -- not a
-  // near-flat "tilted heatmap" view. Zoomed in close enough for a single
-  // tree's canopy structure to read as individual points, not a carpet.
+  const { lon, lat, bounds } = resolveInspectionAnchor(map, { parcelId, treeId, treetopProps });
+  const center = { lng: lon, lat };
+
+  // Enabling terrain before the DEM tile for this location has actually
+  // loaded makes MapLibre clamp any pitched camera we set right after --
+  // it protects against the camera ending up underground once real
+  // (~300m+) elevation data arrives, which visibly collapsed the intended
+  // pitch/zoom in testing. Jump directly over the target first (flat), so
+  // the terrain tile for the correct location loads, THEN enable terrain
+  // and ease into the oblique view once MapLibre is idle.
+  map.jumpTo({ center, zoom: Math.max(map.getZoom(), treeId ? 19.5 : 17), pitch: 0, bearing: 0 });
+  window.__timberRadarSetTerrain?.(true);
+  await new Promise((resolve) => {
+    map.once("idle", resolve);
+    setTimeout(resolve, 2000); // don't block indefinitely if idle never fires
+  });
+  // Oblique camera with real vertical relief. Pitch is deliberately more
+  // moderate than a first attempt at "dramatic" (68deg) -- at very steep
+  // pitch, the EPT loader's viewport-driven node selection (see the
+  // top-of-file note; the library does not honor a spatial `bounds`
+  // option, it infers needed octree nodes from the projected ground
+  // footprint of the camera viewport) fetches a much larger ground
+  // footprint toward the horizon, which is what produced the oversized
+  // rectangular "slab" of points. A more moderate pitch keeps that
+  // footprint closer to the actual inspection target while still reading
+  // as clearly 3D/oblique.
   const framedView = treeId
-    ? { center, zoom: Math.max(map.getZoom(), 19.2), pitch: 68, bearing: 35 }
-    : { center, zoom: Math.max(map.getZoom(), 16.5), pitch: 62, bearing: 25 };
+    ? { center, zoom: Math.max(map.getZoom(), 19.5), pitch: 48, bearing: 30 }
+    : { center, zoom: Math.max(map.getZoom(), 17), pitch: 42, bearing: 20 };
 
   map.easeTo({ ...framedView, duration: 700 });
+
+  if (treeId && treetopProps?.height_max_ft != null) {
+    window.__timberRadarSetTreeRuler?.(lon, lat, treetopProps.height_max_ft * 0.3048);
+  } else {
+    window.__timberRadarSetTreeRuler?.(null, null, null);
+  }
 
   try {
     const mod = await getLidarModule();
@@ -199,15 +232,76 @@ export async function openLidarInspection(map, { parcelId, treeId, treetopProps 
     });
 
     // Deliberately no camera call here -- with autoZoom disabled above,
-    // the view we set with map.easeTo(framedView) before streaming started
-    // is left alone, which is what keeps the adaptive streaming manager
-    // (and the actual rendered points) intact.
+    // the view set via map.easeTo(framedView) before streaming started is
+    // left alone, which is what keeps the adaptive streaming manager (and
+    // the actual rendered points) intact.
+    const bounds2 = ctrl.getState().computedColorBounds;
+    lastGroundEstimateM = bounds2?.min ?? null;
+    lastTopEstimateM = bounds2?.max ?? null;
+    applyRenderMode(currentMode);
+
     const progress = ctrl.getStreamingProgress() || {};
     showStatusBadge("loaded", { treeId, parcelId, pointCount: progress.loadedPoints ?? 0 });
+    showModeStrip();
   } catch (err) {
     console.error("LiDAR streaming failed:", err);
     showStatusBadge("error", { treeId, parcelId, message: err.message });
   }
+}
+
+function applyRenderMode(mode) {
+  currentMode = mode;
+  if (!lidarControl) return;
+  const ground = lastGroundEstimateM;
+  const top = lastTopEstimateM;
+  try {
+    if (mode === "classified") {
+      lidarControl.clearElevationRange?.();
+      lidarControl.setColorScheme("classification");
+      return;
+    }
+    lidarControl.setColorScheme("elevation");
+    lidarControl.setColormap("terrain");
+    if (ground != null && top != null && top > ground) {
+      lidarControl.setUsePercentile(false);
+      lidarControl.setColorRange({ mode: "absolute", absoluteMin: ground, absoluteMax: top });
+      if (mode === "canopy") {
+        // Height-above-ground is not literally computed per point here
+        // (that needs per-point DTM subtraction, a larger follow-up), but
+        // this suppresses the ground/near-ground return band using the
+        // real loaded-cloud elevation bounds, so the visible points read
+        // as vegetation/canopy rather than a solid ground plane.
+        const groundBandM = Math.min(2.0, (top - ground) * 0.1);
+        lidarControl.setElevationRange?.([ground + groundBandM, top + 1]);
+      } else {
+        lidarControl.clearElevationRange?.();
+      }
+    } else {
+      lidarControl.setUsePercentile(true);
+      lidarControl.clearElevationRange?.();
+    }
+  } catch (e) {
+    console.warn("Render mode not fully applied:", e);
+  }
+}
+
+function showModeStrip() {
+  const strip = document.querySelector("#lidar-mode-strip");
+  if (!strip) return;
+  strip.hidden = false;
+  strip.querySelectorAll(".lidar-mode-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mode === currentMode);
+    btn.onclick = () => {
+      strip.querySelectorAll(".lidar-mode-btn").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      applyRenderMode(btn.dataset.mode);
+    };
+  });
+}
+
+function hideModeStrip() {
+  const strip = document.querySelector("#lidar-mode-strip");
+  if (strip) strip.hidden = true;
 }
 
 function showStatusBadge(status, { treeId, parcelId, pointCount, message } = {}) {
@@ -226,7 +320,7 @@ function showStatusBadge(status, { treeId, parcelId, pointCount, message } = {})
     line2 = pointCount ? `${pointCount.toLocaleString()} points` : `USGS 3DEP · ${targetLabel}`;
   } else if (status === "loaded") {
     line1 = `${(pointCount ?? 0).toLocaleString()} points`;
-    line2 = "Height coloring · USGS 3DEP";
+    line2 = "USGS 3DEP · Back to map ✕";
   } else if (status === "error") {
     line1 = "LiDAR unavailable";
     line2 = message ?? "Camera framing shown above";
@@ -242,6 +336,7 @@ function showStatusBadge(status, { treeId, parcelId, pointCount, message } = {})
 function closeLidarInspection() {
   const badge = document.querySelector("#lidar-status-badge");
   if (badge) badge.hidden = true;
+  hideModeStrip();
   // Unload/stop the point-cloud overlay FIRST -- deck.gl's own render loop
   // can otherwise keep re-asserting the pitched camera view while it's
   // still active, fighting a camera reset issued while it's live.
@@ -255,4 +350,7 @@ function closeLidarInspection() {
     restoreAnalyticalLayers(map);
     if (previousCameraState) map.jumpTo(previousCameraState);
   }
+  window.__timberRadarSetTerrain?.(false);
+  window.__timberRadarSetTreeRuler?.(null, null, null);
+  window.__timberRadarSetInspectMode?.(false);
 }
