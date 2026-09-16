@@ -1,0 +1,176 @@
+:root {
+  --bg: #0b0d0c;
+  --panel: #111512;
+  --panel-2: #161c17;
+  --border: rgba(255,255,255,.10);
+  --text: #f5f5f4;
+  --muted: rgba(255,255,255,.55);
+  --accent: #eab308;
+  --score-low: #4b5563;
+  --score-med: #eab308;
+  --score-high: #65a30d;
+  --score-top: #166534;
+}
+
+html, body, #app { width: 100%; height: 100%; margin: 0; }
+body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+
+#app {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-rows: 56px 1fr;
+  grid-template-areas: "topbar topbar" "map sidebar";
+  height: 100%;
+}
+
+#topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.eyebrow { font-size: 12px; letter-spacing: .14em; font-weight: 600; opacity: .85; }
+.score-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+
+.layer-controls { display: flex; gap: 16px; flex: 1; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+.layer-controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
+
+.pill-button {
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  padding: 8px 14px; border-radius: 999px; cursor: pointer; font-size: 13px;
+}
+.pill-button:hover { background: #1e2620; }
+
+#map { grid-area: map; width: 100%; height: 100%; position: relative; }
+
+#sidebar {
+  grid-area: sidebar;
+  display: flex; flex-direction: column;
+  background: var(--panel); border-left: 1px solid var(--border);
+  overflow: hidden;
+  min-height: 0; /* grid items default to min-height:auto (content-based),
+    which without this override let the 5792-row list grow the sidebar
+    past its grid track instead of being constrained + internally
+    scrollable -- same root cause as the classic flex "min-height:0" bug,
+    but at the CSS Grid item boundary. */
+}
+
+.section { border-bottom: 1px solid var(--border); }
+.section.grow { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.section-header {
+  width: 100%; text-align: left; background: none; border: none; color: var(--text);
+  padding: 12px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.section-header.static { cursor: default; color: var(--muted); font-weight: 500; }
+.section-header .chev { transition: transform .15s; opacity: .6; }
+.section-header[aria-expanded="true"] .chev { transform: rotate(180deg); }
+.section-body { padding: 4px 16px 16px; display: flex; flex-direction: column; gap: 10px; }
+.section-body[hidden] { display: none; } /* an author rule of equal specificity to `.section-body`
+  setting `display:flex` unconditionally would otherwise beat the UA stylesheet's default
+  `[hidden]{display:none}`, so the collapsed filters panel never actually collapsed -- it kept
+  taking up real layout space and pushed the ranked list below the visible/scrollable area,
+  especially visible (and functionally broken) on mobile viewports. */
+
+.filter-row { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.filter-row input[type="number"] {
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 8px; border-radius: 6px; font-size: 13px;
+}
+.filter-row input[type="range"] { width: 100%; }
+.filter-value { color: var(--text); font-size: 12px; align-self: flex-end; }
+.filter-check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.text-button {
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; align-self: flex-start;
+}
+.text-button:hover { color: var(--text); border-color: rgba(255,255,255,.3); }
+
+.ranked-list { flex: 1; overflow-y: auto; padding: 4px 8px 8px; }
+.result-row {
+  display: grid; grid-template-columns: 40px 1fr; gap: 10px;
+  padding: 10px 8px; border-radius: 8px; cursor: pointer; margin-bottom: 4px;
+  border: 1px solid transparent;
+}
+.result-row:hover { background: var(--panel-2); }
+.result-row.selected { background: rgba(234,179,8,.10); border-color: rgba(234,179,8,.4); }
+.result-score {
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 15px; border-radius: 6px; height: 36px; color: #0b0d0c;
+}
+.result-meta { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+.result-meta .pid { color: var(--text); font-size: 12.5px; font-weight: 600; display: block; margin-bottom: 2px; }
+.result-meta .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; }
+.status-chip {
+  display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--border); margin-top: 3px;
+}
+.status-chip.full { color: #86efac; border-color: rgba(134,239,172,.35); }
+.status-chip.provisional { color: #fcd34d; border-color: rgba(252,211,77,.35); }
+
+.overlay-panel {
+  position: absolute; top: 64px; right: 368px; width: 360px; max-height: calc(100% - 80px);
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5); overflow-y: auto; z-index: 5;
+}
+.icon-button {
+  background: none; border: none; color: var(--muted); font-size: 16px; cursor: pointer;
+  position: absolute; top: 10px; right: 10px;
+}
+.icon-button:hover { color: var(--text); }
+
+#detail-body { padding: 20px; }
+.detail-title { font-size: 18px; font-weight: 700; margin-bottom: 2px; }
+.detail-sub { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+.score-hero { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+.score-hero .num { font-size: 40px; font-weight: 800; }
+.score-hero .label { font-size: 12px; color: var(--muted); }
+.component-bar-row { margin-bottom: 10px; }
+.component-bar-label { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; }
+.component-bar-label .not-included { color: #94a3b8; font-style: italic; }
+.component-bar-track { height: 6px; background: rgba(255,255,255,.08); border-radius: 999px; overflow: hidden; }
+.component-bar-fill { height: 100%; background: var(--accent); border-radius: 999px; }
+.detail-metrics { margin-top: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; font-size: 12.5px; }
+.detail-metrics dt { color: var(--muted); }
+.detail-metrics dd { margin: 2px 0 0; font-weight: 600; }
+.coverage-note {
+  margin-top: 16px; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+  border: 1px solid rgba(252,211,77,.3); background: rgba(252,211,77,.06); color: #fde68a;
+}
+.fallback-note {
+  margin-top: 10px; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+  border: 1px solid rgba(148,163,184,.3); background: rgba(148,163,184,.06); color: #cbd5e1;
+}
+.detail-actions { margin-top: 18px; display: flex; gap: 8px; }
+
+.drawer-header {
+  padding: 14px 16px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 14px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.shortlist-body { padding: 8px 12px; min-height: 60px; }
+.shortlist-row {
+  display: flex; justify-content: space-between; align-items: center; padding: 8px 6px;
+  border-bottom: 1px solid var(--border); font-size: 12.5px;
+}
+.shortlist-row button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+.shortlist-row button:hover { color: #f87171; }
+.drawer-actions { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
+.empty-note { padding: 20px; text-align: center; color: var(--muted); font-size: 13px; }
+
+.maplibregl-popup { display: none; }
+
+@media (max-width: 900px) {
+  /* The topbar wraps to multiple lines at narrow widths (brand + 4 layer
+     toggles + shortlist button don't fit one row) -- a fixed 56px grid row
+     clipped the wrapped content (the "Roads" toggle was unreachable).
+     `auto` lets the row grow to fit its wrapped content instead. */
+  #app { grid-template-columns: 1fr; grid-template-rows: auto 50vh 1fr; grid-template-areas: "topbar" "map" "sidebar"; height: 100%; }
+  #topbar { flex-wrap: wrap; height: auto; padding: 10px 14px; row-gap: 8px; }
+  .layer-controls { flex-basis: 100%; order: 3; gap: 12px; }
+  #sidebar { border-left: 0; border-top: 1px solid var(--border); }
+  .overlay-panel { right: 12px; left: 12px; width: auto; top: auto; bottom: 12px; max-height: 70vh; }
+}

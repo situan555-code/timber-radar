@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Timber Radar</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">
+        <span class="eyebrow">TIMBER RADAR</span>
+        <span class="score-badge" id="score-version-badge">score v0.95</span>
+      </div>
+      <div id="layer-controls" class="layer-controls">
+        <label><input type="checkbox" id="layer-score" checked /> Opportunity score</label>
+        <label><input type="checkbox" id="layer-boundaries" checked /> Boundaries</label>
+        <label><input type="checkbox" id="layer-chm" /> Tree height (CHM)</label>
+        <label><input type="checkbox" id="layer-roads" /> Roads</label>
+      </div>
+      <button id="shortlist-toggle" class="pill-button" type="button">Shortlist (<span id="shortlist-count">0</span>)</button>
+    </header>
+
+    <div id="map"></div>
+
+    <aside id="sidebar">
+      <div id="filters" class="section">
+        <button id="filters-toggle" class="section-header" type="button" aria-expanded="false">
+          Filters <span class="chev">▾</span>
+        </button>
+        <div id="filters-body" class="section-body" hidden>
+          <label class="filter-row">Min timber score
+            <input type="range" id="f-score" min="0" max="100" value="0" />
+            <span class="filter-value" id="f-score-val">0</span>
+          </label>
+          <label class="filter-row">Min parcel acres
+            <input type="number" id="f-acres" min="0" value="0" />
+          </label>
+          <label class="filter-row">Min wooded acres
+            <input type="number" id="f-wooded" min="0" value="0" />
+          </label>
+          <label class="filter-row">Min canopy p90 (ft)
+            <input type="number" id="f-canopy" min="0" value="0" />
+          </label>
+          <label class="filter-row">Max road distance (ft)
+            <input type="number" id="f-road" min="0" placeholder="no limit" />
+          </label>
+          <label class="filter-row">Min continuity %
+            <input type="range" id="f-continuity" min="0" max="100" value="0" />
+            <span class="filter-value" id="f-continuity-val">0%</span>
+          </label>
+          <label class="filter-check"><input type="checkbox" id="f-full-coverage" /> Full-coverage only (95%)</label>
+          <label class="filter-check"><input type="checkbox" id="f-exclude-fallback" /> Exclude road-distance fallback</label>
+          <button id="filters-reset" class="text-button" type="button">Reset filters</button>
+        </div>
+      </div>
+
+      <div id="list-view" class="section grow">
+        <div class="section-header static">
+          <span id="result-count">5792 parcels</span>
+          <span class="muted">sorted by score ↓</span>
+        </div>
+        <div id="ranked-list" class="ranked-list"></div>
+      </div>
+    </aside>
+
+    <div id="detail-panel" class="overlay-panel" hidden>
+      <button id="detail-close" class="icon-button" type="button" aria-label="Close">✕</button>
+      <div id="detail-body"></div>
+    </div>
+
+    <div id="shortlist-drawer" class="overlay-panel" hidden>
+      <div class="drawer-header">
+        <span>Shortlist</span>
+        <button id="shortlist-close" class="icon-button" type="button" aria-label="Close">✕</button>
+      </div>
+      <div id="shortlist-body" class="shortlist-body"></div>
+      <div class="drawer-actions">
+        <button id="shortlist-export-csv" class="text-button" type="button">Export CSV</button>
+        <button id="shortlist-export-geojson" class="text-button" type="button">Export GeoJSON</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
