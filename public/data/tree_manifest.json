@@ -8,7 +8,9 @@
     "crown_equivalent_diameter_ft",
     "segmentation_version",
     "boundary_touching",
-    "quality_flags_flat"
+    "quality_flags_flat",
+    "treetop_lon",
+    "treetop_lat"
   ],
   "crown_count": 447646,
   "crowns_maxzoom": 17,

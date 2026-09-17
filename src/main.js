@@ -170,11 +170,15 @@ window.__timberRadarSetInspectMode = (active) => {
   document.querySelector("#app").classList.toggle("inspect-3d", !!active);
 };
 
-// Elevated crown indicator: the same measured crown polygon, re-extruded
-// to sit as a thin shell near the canopy's real measured top (the top
-// 15% of height_max_ft) instead of on the ground, so the selected crown
-// visually intersects the canopy volume instead of only showing a ground
-// footprint. Derived only from real geometry + height_max_ft.
+// Elevated crown indicator: the measured crown polygon re-extruded as a
+// THIN shell (0.6m, not a 15%-of-height block) right at the canopy's real
+// measured top, so it reads as a legible marker identifying which canopy
+// is selected -- not a fake solid crown volume. Ground footprint stays
+// separately visible (subtle) via the existing selected-outline/-fill
+// layers. Geometry comes from the vector-tile crown feature -- this is
+// still a real, measured polygon (the same one tippecanoe derives from
+// the canonical crowns.geojson), not queryRenderedFeatures-fabricated
+// geometry; simplification is modest (see build_tree_tiles.py).
 window.__timberRadarSetElevatedCrown = (geometry, heightM) => {
   const src = map.getSource("selected-crown-elevated");
   if (!src) return;
@@ -182,26 +186,34 @@ window.__timberRadarSetElevatedCrown = (geometry, heightM) => {
     src.setData({ type: "FeatureCollection", features: [] });
     return;
   }
+  const shellThicknessM = Math.min(0.6, heightM * 0.05);
   src.setData({
     type: "FeatureCollection",
-    features: [{ type: "Feature", properties: { base_m: heightM * 0.85, top_m: heightM }, geometry }],
+    features: [{ type: "Feature", properties: { base_m: heightM - shellThicknessM, top_m: heightM }, geometry }],
   });
 };
 
-window.__timberRadarSetDebugBbox = (bounds) => {
+// Draws the exact circular region the temporary rendering-side LiDAR clip
+// uses (item 5: a crown/context circle, not a hard axis-aligned rectangle).
+window.__timberRadarSetDebugBbox = (center, radiusM) => {
   const src = map.getSource("lidar-debug-bbox");
   if (!src) return;
-  if (!bounds) {
+  if (!center || !radiusM) {
     src.setData({ type: "FeatureCollection", features: [] });
     return;
   }
-  const [west, south, east, north] = bounds;
+  const [lon, lat] = center;
+  const mPerDegLat = 111320;
+  const mPerDegLon = 111320 * Math.cos((lat * Math.PI) / 180);
+  const steps = 48;
+  const ring = [];
+  for (let i = 0; i <= steps; i++) {
+    const theta = (i / steps) * 2 * Math.PI;
+    ring.push([lon + (radiusM * Math.cos(theta)) / mPerDegLon, lat + (radiusM * Math.sin(theta)) / mPerDegLat]);
+  }
   src.setData({
     type: "FeatureCollection",
-    features: [{
-      type: "Feature", properties: {},
-      geometry: { type: "Polygon", coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]] },
-    }],
+    features: [{ type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [ring] } }],
   });
 };
 
@@ -347,10 +359,23 @@ function buildResultRow(row) {
   return el;
 }
 
-function selectParcel(parcelId, { fly = false } = {}) {
+async function selectParcel(parcelId, { fly = false } = {}) {
   selectedId = parcelId;
   const row = indexById.get(parcelId);
   if (!row) return;
+
+  // Selecting a parcel directly (ranked list, shortlist) while a tree/3D
+  // inspection is active must fully tear that state down first -- appState
+  // owns DOM visibility, so this must happen before openDetailPanel runs.
+  if (appState === "TREE_LIDAR_3D") {
+    const mod = await getLidarModuleRef();
+    mod.closeLidarInspection();
+  }
+  if (appState !== "PARCEL_2D") {
+    closeTreeDetailPanel();
+    appState = "PARCEL_2D";
+  }
+  applyAppState();
 
   document.querySelectorAll(".result-row").forEach((el) => {
     el.classList.toggle("selected", el.dataset.parcelId === parcelId);
@@ -462,6 +487,24 @@ async function getLidarModuleRef() {
   return lidarModuleRef;
 }
 
+// Single source of truth for which panel is visible. Every appState
+// transition calls this -- DOM visibility is DERIVED from appState, never
+// set ad hoc at each call site (that's what let the parcel panel stay
+// visible underneath the tree card in production: individual handlers
+// showed one panel without a corresponding rule to hide the other).
+function applyAppState() {
+  const parcelPanel = document.querySelector("#detail-panel");
+  const treePanel = document.querySelector("#tree-detail-panel");
+  if (appState === "PARCEL_2D") {
+    treePanel.hidden = true;
+    // parcelPanel's own hidden state is driven by whether a parcel is
+    // actually selected (openDetailPanel / #detail-close), not by appState.
+  } else if (appState === "TREE_2D" || appState === "TREE_LIDAR_3D") {
+    parcelPanel.hidden = true;
+    treePanel.hidden = false; // content (full vs. compact) is set by the caller
+  }
+}
+
 async function selectTree(props, geometry) {
   // Defensive guard (item 8): selecting a tree should never be reachable
   // while a 3D inspection is still active (the crown layer that dispatches
@@ -476,6 +519,7 @@ async function selectTree(props, geometry) {
   lastSelectedTreeProps = props;
   lastSelectedTreeGeometry = geometry;
   appState = "TREE_2D";
+  applyAppState();
   if (map.getLayer("tree-crown-selected-outline")) {
     map.setFilter("tree-crown-selected-outline", ["==", ["get", "tree_id"], props.tree_id]);
     map.setFilter("tree-crown-selected-fill", ["==", ["get", "tree_id"], props.tree_id]);
@@ -527,6 +571,7 @@ function openTreeDetailPanel(props) {
       appState = "PARCEL_2D";
       closeTreeDetailPanel();
       selectParcel(parcelId, { fly: false });
+      applyAppState();
     });
   }
   document.querySelector("#tree-inspect-lidar").addEventListener("click", () => {
@@ -556,6 +601,7 @@ function showCompact3DCard(props) {
     mod.closeLidarInspection();
     appState = "TREE_2D";
     if (lastSelectedTreeProps) openTreeDetailPanel(lastSelectedTreeProps);
+    applyAppState();
   });
   document.querySelector("#lidar-recenter").addEventListener("click", async () => {
     const mod = await getLidarModuleRef();
@@ -581,6 +627,7 @@ async function openLidarInspection(target) {
   // exactly the mixed-state bug this state machine exists to prevent.
   appState = "TREE_LIDAR_3D";
   showCompact3DCard(target.treetopProps);
+  applyAppState();
   const mod = await getLidarModuleRef();
   await mod.openLidarInspection(map, target);
 }
@@ -832,8 +879,10 @@ map.on("load", () => {
       type: "fill-extrusion",
       source: "selected-crown-elevated",
       paint: {
-        "fill-extrusion-color": "#facc15",
-        "fill-extrusion-opacity": 0.55,
+        // Bright, low-opacity thin shell -- a legible marker for "this
+        // canopy," not an opaque fabricated volume.
+        "fill-extrusion-color": "#67e8f9",
+        "fill-extrusion-opacity": 0.4,
         "fill-extrusion-base": ["get", "base_m"],
         "fill-extrusion-height": ["get", "top_m"],
       },
@@ -1001,6 +1050,7 @@ document.querySelector("#tree-detail-close").addEventListener("click", async () 
   }
   appState = "PARCEL_2D";
   closeTreeDetailPanel();
+  applyAppState();
 });
 
 // Shortlist drawer

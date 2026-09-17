@@ -11,16 +11,20 @@
 // three canonical treetops agree with CHM/DTM-derived height/position
 // closely. The LiDAR data itself is correctly georeferenced.
 //
-// Real EPT clipping (2026-09-16 round 2): the library's
+// TEMPORARY rendering-side clip (2026-09-16, round 2-5): the library's
 // loadPointCloudEptStreaming does NOT support a spatial `bounds` option
 // -- it silently ignores it and selects octree nodes from the camera
 // viewport's projected ground footprint instead. That produced a large
 // hard-edged rectangular point mass unrelated to the selected tree (the
-// "slab" bug). Fixed by wrapping the internal point-cloud manager's
-// update methods to spatially clip every incoming batch to the actual
-// inspection bbox before it ever reaches the renderer -- extra octree
-// nodes may still be fetched over the network, but nothing outside the
-// inspection region is ever added to the drawable point set.
+// "slab" bug). Wrapping the internal point-cloud manager's update methods
+// to spatially clip every incoming batch to a circular inspection region
+// BEFORE it reaches the renderer removes the slab from the visible
+// product -- but this is explicitly a rendering-side workaround, NOT a
+// structural fix: the library still fetches hundreds of thousands of
+// EPT nodes over the network for the wider viewport footprint, most of
+// which are discarded client-side after arriving. A real fix needs
+// node-selection/network-level intersection (vendoring or wrapping the
+// EPT octree traversal itself), which remains a documented follow-up.
 
 const LIDAR_MODULE_URL = "https://esm.sh/maplibre-gl-lidar@0.17.0";
 const EPT_SOURCE_URL = "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/OH_Statewide_Phase2_6_2020/ept.json";
@@ -39,15 +43,19 @@ const SUPPRESSED_LAYER_IDS = [
 
 let lidarModulePromise = null;
 let lidarControl = null;
-let previousCameraState = null;
+// Captured ONCE per 3D session (TREE_2D -> TREE_LIDAR_3D), never
+// overwritten by Recenter -- see recenterOnTree()/openLidarInspection().
+let sessionEntryCamera = null;
 let currentCloudId = null;
 let suppressedLayerPriorVisibility = null;
 let currentMode = "canopy";
 let lastGroundEstimateM = null;
 let lastTopEstimateM = null;
-let currentInspectionBounds = null;
-let currentInspectionCenter = null;
+let currentInspectionCenter = null; // [lon, lat]
+let currentInspectionRadiusM = null;
 let lastTarget = null;
+let lastRawFetchedPoints = 0;
+let lastClippedPoints = 0;
 
 function isMobileWidth() {
   return window.innerWidth < MOBILE_WIDTH_BREAKPOINT;
@@ -63,23 +71,32 @@ async function getLidarModule() {
   return lidarModulePromise;
 }
 
-// --- Real spatial clipping (item 2) -----------------------------------
+// --- Temporary rendering-side spatial clip (not a structural fix; see
+// the top-of-file note) ------------------------------------------------
 // Wraps _pointCloudManager.updatePointCloud/addPointCloud so every point
-// batch is filtered, BEFORE it reaches the renderer, to points whose
-// absolute lon/lat fall inside the current inspection bbox. Positions are
-// stored as [dLon, dLat, z] offsets from a `coordinateOrigin` (verified
-// empirically -- the origin is the EPT source's own dataset-center
-// metadata, unrelated to our query), so absolute = origin + offset.
-function clipPointCloudData(data, bounds) {
-  if (!bounds || !data?.positions || !data.coordinateOrigin) return data;
-  const [west, south, east, north] = bounds;
+// batch is filtered, BEFORE it reaches the renderer, to points within a
+// CIRCULAR region around the inspection center (a crown/context mask
+// reads more naturally than a hard axis-aligned rectangle, and avoids
+// the rectangle's corners including irrelevant far context). Positions
+// are stored as [dLon, dLat, z] offsets from a `coordinateOrigin`
+// (verified empirically -- the origin is the EPT source's own
+// dataset-center metadata, unrelated to our query), so absolute = origin
+// + offset.
+function clipPointCloudData(data, center, radiusM) {
+  if (!center || !radiusM || !data?.positions || !data.coordinateOrigin) return data;
+  const [centerLon, centerLat] = center;
   const [ox, oy] = data.coordinateOrigin;
+  const latRad = (centerLat * Math.PI) / 180;
+  const mPerDegLat = 111320;
+  const mPerDegLon = 111320 * Math.cos(latRad);
   const n = data.pointCount ?? data.positions.length / 3;
   const keep = [];
   for (let i = 0; i < n; i++) {
     const lon = ox + data.positions[i * 3];
     const lat = oy + data.positions[i * 3 + 1];
-    if (lon >= west && lon <= east && lat >= south && lat <= north) keep.push(i);
+    const dxM = (lon - centerLon) * mPerDegLon;
+    const dyM = (lat - centerLat) * mPerDegLat;
+    if (dxM * dxM + dyM * dyM <= radiusM * radiusM) keep.push(i);
   }
   const m = keep.length;
   const outPositions = new Float32Array(m * 3);
@@ -116,7 +133,15 @@ function installSpatialClip(ctrl) {
   for (const methodName of ["updatePointCloud", "addPointCloud"]) {
     const orig = pcm[methodName]?.bind(pcm);
     if (!orig) continue;
-    pcm[methodName] = (id, data) => orig(id, clipPointCloudData(data, currentInspectionBounds));
+    pcm[methodName] = (id, data) => {
+      // Telemetry (item 3): raw fetched count is whatever the loader
+      // handed us BEFORE our clip; reported honestly even though it's
+      // discarded immediately after.
+      lastRawFetchedPoints = data?.pointCount ?? data?.positions?.length / 3 ?? 0;
+      const clipped = clipPointCloudData(data, currentInspectionCenter, currentInspectionRadiusM);
+      lastClippedPoints = clipped?.pointCount ?? 0;
+      return orig(id, clipped);
+    };
   }
   pcm.__trClipInstalled = true;
 }
@@ -165,32 +190,18 @@ function restoreAnalyticalLayers(map) {
   suppressedLayerPriorVisibility = null;
 }
 
-function metersToDegreesLat(m) {
-  return m / 111320;
-}
-function metersToDegreesLon(m, atLat) {
-  return m / (111320 * Math.cos((atLat * Math.PI) / 180));
-}
-
-function bboxAround(lon, lat, marginM) {
-  const dLon = metersToDegreesLon(marginM, lat);
-  const dLat = metersToDegreesLat(marginM);
-  return [lon - dLon, lat - dLat, lon + dLon, lat + dLat];
-}
-
 function flattenCoords(geometry) {
   if (geometry.type === "Polygon") return geometry.coordinates.flat();
   if (geometry.type === "MultiPolygon") return geometry.coordinates.flat(2);
   return [];
 }
 
+// Circular crown/context mask (item 5) instead of an axis-aligned
+// rectangle -- reads more naturally as "this tree + context" than a hard
+// rectangle whose corners pull in irrelevant far ground.
 function resolveInspectionAnchor(map, { parcelId, treeId, treetopProps }) {
   if (treeId && treetopProps?.treetop_lon != null && treetopProps?.treetop_lat != null) {
-    return {
-      lon: treetopProps.treetop_lon,
-      lat: treetopProps.treetop_lat,
-      bounds: bboxAround(treetopProps.treetop_lon, treetopProps.treetop_lat, TREE_CONTEXT_MARGIN_M),
-    };
+    return { lon: treetopProps.treetop_lon, lat: treetopProps.treetop_lat, radiusM: TREE_CONTEXT_MARGIN_M };
   }
   if (parcelId) {
     const feature = map.queryRenderedFeatures({ layers: ["parcel-fill"] }).find((f) => f.properties.parcel_id === parcelId);
@@ -199,49 +210,60 @@ function resolveInspectionAnchor(map, { parcelId, treeId, treetopProps }) {
       if (coords.length) {
         const lon = coords.reduce((s, c) => s + c[0], 0) / coords.length;
         const lat = coords.reduce((s, c) => s + c[1], 0) / coords.length;
-        let west = Infinity, south = Infinity, east = -Infinity, north = -Infinity;
-        for (const [x, y] of coords) { west = Math.min(west, x); east = Math.max(east, x); south = Math.min(south, y); north = Math.max(north, y); }
-        const dLon = metersToDegreesLon(PARCEL_MARGIN_M, lat);
-        const dLat = metersToDegreesLat(PARCEL_MARGIN_M);
-        return { lon, lat, bounds: [west - dLon, south - dLat, east + dLon, north + dLat] };
+        const mPerDegLat = 111320;
+        const mPerDegLon = 111320 * Math.cos((lat * Math.PI) / 180);
+        let maxDistM = 0;
+        for (const [x, y] of coords) {
+          const dM = Math.hypot((x - lon) * mPerDegLon, (y - lat) * mPerDegLat);
+          maxDistM = Math.max(maxDistM, dM);
+        }
+        return { lon, lat, radiusM: maxDistM + PARCEL_MARGIN_M };
       }
     }
   }
   const c = map.getCenter();
-  return { lon: c.lng, lat: c.lat, bounds: bboxAround(c.lng, c.lat, 150) };
+  return { lon: c.lng, lat: c.lat, radiusM: 150 };
 }
 
 function logDebugTelemetry(stage, extra) {
   const info = {
     stage,
     canonical_lon_lat: currentInspectionCenter,
-    inspection_bbox: currentInspectionBounds,
+    inspection_radius_m: currentInspectionRadiusM,
+    rawFetchedPoints: lastRawFetchedPoints,
+    spatiallyClippedPoints: lastClippedPoints,
     ...extra,
   };
   window.LIDAR_INSPECTION_DEBUG = { ...(window.LIDAR_INSPECTION_DEBUG || {}), [stage]: info };
   console.log("[LIDAR_INSPECTION_DEBUG]", stage, info);
 }
 
-export async function openLidarInspection(map, target) {
+export async function openLidarInspection(map, target, opts = {}) {
+  const isRecenter = !!opts.isRecenter;
   const { parcelId, treeId, treetopProps, geometry } = target;
   lastTarget = target;
   showStatusBadge("loading", { treeId, parcelId });
   window.__timberRadarSetInspectMode?.(true);
 
-  previousCameraState = {
-    center: map.getCenter(),
-    zoom: map.getZoom(),
-    pitch: map.getPitch(),
-    bearing: map.getBearing(),
-  };
+  // Captured ONLY on a fresh 2D->3D entry, never on Recenter -- Recenter
+  // must be able to move the camera and refresh streaming without ever
+  // overwriting the state "Back to map" restores to (item 2 fix).
+  if (!isRecenter) {
+    sessionEntryCamera = {
+      center: map.getCenter(),
+      zoom: map.getZoom(),
+      pitch: map.getPitch(),
+      bearing: map.getBearing(),
+    };
+  }
 
   suppressAnalyticalLayers(map);
 
-  const { lon, lat, bounds } = resolveInspectionAnchor(map, { parcelId, treeId, treetopProps });
-  currentInspectionBounds = bounds;
+  const { lon, lat, radiusM } = resolveInspectionAnchor(map, { parcelId, treeId, treetopProps });
   currentInspectionCenter = [lon, lat];
+  currentInspectionRadiusM = radiusM;
   const center = { lng: lon, lat };
-  window.__timberRadarSetDebugBbox?.(bounds);
+  window.__timberRadarSetDebugBbox?.(currentInspectionCenter, currentInspectionRadiusM);
 
   map.jumpTo({ center, zoom: Math.max(map.getZoom(), treeId ? 19.5 : 17), pitch: 0, bearing: 0 });
   window.__timberRadarSetTerrain?.(true);
@@ -276,7 +298,10 @@ export async function openLidarInspection(map, target) {
       currentCloudId = null;
     }
 
-    await ctrl.loadPointCloudEptStreaming(EPT_SOURCE_URL, { bounds, pointBudget });
+    // `bounds` is deliberately NOT passed here -- confirmed (see top-of-file
+    // note) that the library silently ignores it; passing it would just be
+    // misleading dead code implying protection that doesn't exist.
+    await ctrl.loadPointCloudEptStreaming(EPT_SOURCE_URL, { pointBudget });
     await new Promise((resolve) => {
       const start = Date.now();
       const poll = () => {
@@ -314,15 +339,21 @@ export async function openLidarInspection(map, target) {
       lastTopEstimateM = null;
     }
     applyRenderMode(currentMode);
+    const modeVisible = countModeVisiblePoints(merged);
     logDebugTelemetry("loaded", {
-      total_loaded_points: progress.loadedPoints ?? 0,
-      points_after_spatial_clip: insideCount,
-      percent_inside_bbox: insideCount != null && progress.loadedPoints ? Math.round((insideCount / progress.loadedPoints) * 1000) / 10 : null,
+      rawFetchedPoints: lastRawFetchedPoints,
+      spatiallyClippedPoints: insideCount,
+      modeVisiblePoints: modeVisible,
+      percent_clipped_of_raw: insideCount != null && lastRawFetchedPoints ? Math.round((insideCount / lastRawFetchedPoints) * 1000) / 10 : null,
       ground_estimate_m: lastGroundEstimateM,
       top_estimate_m: lastTopEstimateM,
+      elevation_range: lidarControl?.getState()?.elevationRange ?? null,
     });
 
-    showStatusBadge("loaded", { treeId, parcelId, pointCount: merged?.pointCount ?? progress.loadedPoints ?? 0 });
+    // The badge must reflect what the ACTIVE render mode actually shows,
+    // not just "loader has N points somewhere" -- that conflation is
+    // exactly what produced the "344k loaded, nothing visible" symptom.
+    showStatusBadge("loaded", { treeId, parcelId, pointCount: modeVisible ?? merged?.pointCount ?? 0 });
     showModeStrip();
   } catch (err) {
     console.error("LiDAR streaming failed:", err);
@@ -330,11 +361,31 @@ export async function openLidarInspection(map, target) {
   }
 }
 
+// Telemetry-only: mirrors the current elevation-range filter against the
+// real loaded Z values, so "modeVisiblePoints" reflects what the active
+// mode should actually be showing (independent of whether the renderer's
+// own GPU-side filter is behaving correctly -- this is what let us catch
+// the setElevationRange(array) bug: this count and the on-screen result
+// disagreed).
+function countModeVisiblePoints(merged) {
+  if (!merged?.positions || !merged.pointCount) return 0;
+  const state = lidarControl?.getState?.();
+  const range = state?.elevationRange;
+  if (!range || range[0] == null || range[1] == null) return merged.pointCount;
+  const [lo, hi] = range;
+  let count = 0;
+  for (let i = 0; i < merged.pointCount; i++) {
+    const z = merged.positions[i * 3 + 2];
+    if (z >= lo && z <= hi) count++;
+  }
+  return count;
+}
+
 export async function recenterOnTree() {
   if (!lastTarget) return;
   const map = window.__timberRadarMap;
   if (!map) return;
-  await openLidarInspection(map, lastTarget);
+  await openLidarInspection(map, lastTarget, { isRecenter: true });
 }
 
 function applyRenderMode(mode) {
@@ -360,7 +411,13 @@ function applyRenderMode(mode) {
         // is an elevation-band approximation, not a classification-based
         // filter. This is disclosed in the UI copy, not claimed as HAG.
         const groundBandM = Math.min(2.0, (top - ground) * 0.1);
-        lidarControl.setElevationRange?.([ground + groundBandM, top + 1]);
+        // REAL BUG FOUND (2026-09-16, round 5): setElevationRange(min, max)
+        // takes two SEPARATE arguments, not a single [min, max] array --
+        // the array form silently produced a broken filter (state showed
+        // elevationRange as [[min,max], null], i.e. `max` was undefined),
+        // which is why Canopy mode removed almost the entire scene despite
+        // ~37k-47k points being genuinely loaded and clipped.
+        lidarControl.setElevationRange?.(ground + groundBandM, top + 1);
       } else {
         lidarControl.clearElevationRange?.();
       }
@@ -383,6 +440,10 @@ function showModeStrip() {
       strip.querySelectorAll(".lidar-mode-btn").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       applyRenderMode(btn.dataset.mode);
+      const merged = lidarControl?._pointCloudManager?.getMergedPointCloudData?.();
+      const modeVisible = countModeVisiblePoints(merged);
+      logDebugTelemetry("mode_changed", { mode: btn.dataset.mode, modeVisiblePoints: modeVisible, elevation_range: lidarControl?.getState()?.elevationRange ?? null });
+      showStatusBadge("loaded", { treeId: lastTarget?.treeId, parcelId: lastTarget?.parcelId, pointCount: modeVisible });
     };
   });
 }
@@ -408,7 +469,7 @@ function showStatusBadge(status, { treeId, parcelId, pointCount, message } = {})
     line2 = pointCount ? `${pointCount.toLocaleString()} points` : `USGS 3DEP · ${targetLabel}`;
   } else if (status === "loaded") {
     line1 = `${(pointCount ?? 0).toLocaleString()} points in view`;
-    line2 = "USGS 3DEP, clipped to selection";
+    line2 = "USGS 3DEP · temporary render clip";
   } else if (status === "error") {
     line1 = "LiDAR unavailable";
     line2 = message ?? "Camera framing shown above";
@@ -429,13 +490,16 @@ export function closeLidarInspection() {
   const map = window.__timberRadarMap;
   if (map) {
     restoreAnalyticalLayers(map);
-    if (previousCameraState) map.jumpTo(previousCameraState);
+    // Always restores to the ORIGINAL 2D entry camera, never a
+    // Recenter-mutated one (item 2 fix -- see openLidarInspection).
+    if (sessionEntryCamera) map.jumpTo(sessionEntryCamera);
   }
   window.__timberRadarSetTerrain?.(false);
   window.__timberRadarSetTreeRuler?.(null, null, null);
   window.__timberRadarSetElevatedCrown?.(null, null);
-  window.__timberRadarSetDebugBbox?.(null);
+  window.__timberRadarSetDebugBbox?.(null, null);
   window.__timberRadarSetInspectMode?.(false);
-  currentInspectionBounds = null;
+  sessionEntryCamera = null;
   currentInspectionCenter = null;
+  currentInspectionRadiusM = null;
 }
