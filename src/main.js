@@ -361,21 +361,22 @@ function buildResultRow(row) {
 }
 
 function resultRowActivityBadgeHtml(parcelId) {
-  const events = activityByParcel.get(parcelId);
-  if (!events || events.length === 0) return "";
-  if (events.length > 1) {
-    return `<div class="row-activity-badge">● ${events.length} activity signals</div>`;
+  // Current/recent only -- NOT activityByParcel (full history). A parcel
+  // whose only activity was a transfer in 2018 must not carry a badge here.
+  const signals = currentSignalsByParcel.get(parcelId);
+  if (!signals || signals.length === 0) return "";
+  if (signals.length > 1) {
+    return `<div class="row-activity-badge">● ${signals.length} activity signals</div>`;
   }
-  const e = events[0];
-  const bucket = TYPE_BUCKET[e.event_type] ?? "other";
-  if (bucket === "transfer") {
+  const { kind, event: e } = signals[0];
+  if (kind === "transfer") {
     const ago = daysAgoLabel(e.event_date);
     return `<div class="row-activity-badge">● Transfer${ago ? " " + ago.replace(" ago", "").replace(" days", "d").replace(" day", "d") : ""}</div>`;
   }
-  if (bucket === "delinquent") {
-    return `<div class="row-activity-badge">● ${e.event_type === "TAX_DELINQUENCY_CLEARED" ? "Delinquency cleared" : "Tax delinquent"}</div>`;
+  if (kind === "delinquent_changed") {
+    return `<div class="row-activity-badge">● Tax delinquent (changed)</div>`;
   }
-  return "";
+  return `<div class="row-activity-badge">● Tax delinquent</div>`;
 }
 
 async function selectParcel(parcelId, { fly = false } = {}) {
@@ -1023,13 +1024,16 @@ fetch(INDEX_URL)
     parcelIndex = rows;
     for (const row of rows) indexById.set(row.parcel_id, row);
     document.querySelector("#result-count").textContent = `${rows.length} parcels`;
+    // Activity/Market may have already resolved with an incomplete
+    // indexById if that fetch finished first (the indexById.has() guards in
+    // computeCurrentSignalsByParcel/currentDelinquencyPseudoEvents would
+    // have dropped every still-unmatched parcel) -- recompute now that
+    // parcel context (score/wooded acres/centroid) is available for the join.
+    refreshCurrentSignals();
     renderList();
     performance.mark("app:list-rendered"); // E05.10.B timing
     renderShortlistDrawer();
     saveShortlist();
-    // Activity/Market may have already rendered with an incomplete
-    // indexById if that fetch resolved first; re-render now that parcel
-    // context (score/wooded acres) is available for the join.
     buildActivityIndicatorLayer();
     if (signalsView === "activity") renderActivityList();
   });
@@ -1191,14 +1195,19 @@ Promise.all([
       if (s.active !== 1 || !s.state_type?.startsWith("delinquent_")) continue;
       delinquentActiveByParcel.set(s.parcel_id, { amount: s.amount, lastSeenAt: s.last_seen_at, sourceId: s.source_id });
     }
-    const changeCutoff = Date.now() - RECENT_CHANGE_WINDOW_DAYS * 86400000;
+    // IMPORTANT: this must use e.detected_at (when Timber Radar's own
+    // pipeline run observed the change), NOT e.event_date. event_date for
+    // a delinquency diff event is the underlying tax-year date
+    // (e.g. "2025-01-01"), which is not when the change was detected --
+    // using it here would make "changed in the last 30 days" fire based on
+    // which calendar year a tax roll covers, not on real recency. detected_at
+    // is an ISO timestamp (unlike event_date's YYYY-MM-DD), so compare it
+    // directly rather than through Date.parse's looser date-only handling.
+    const changeCutoffIso = new Date(Date.now() - RECENT_CHANGE_WINDOW_DAYS * 86400000).toISOString();
     recentlyChangedDelinquentParcels = new Set(
       activityEvents
         .filter((e) => (e.event_type === "TAX_DELINQUENCY_INCREASED" || e.event_type === "TAX_DELINQUENCY_DECREASED"))
-        .filter((e) => {
-          const t = Date.parse(e.event_date);
-          return !Number.isNaN(t) && t >= changeCutoff;
-        })
+        .filter((e) => e.detected_at && e.detected_at >= changeCutoffIso)
         .map((e) => e.parcel_id)
     );
 
@@ -1216,12 +1225,58 @@ Promise.all([
     // sale/opportunity record exists, with no code change needed.
     void salesData;
 
+    refreshCurrentSignals();
     buildActivityIndicatorLayer();
     if (hasActivity) renderActivityList();
     if (hasMarket) renderMarketPanel();
     if (hasActivity && parcelIndex.length > 0) renderList(); // pick up per-row activity badges
   })
   .catch((e) => console.warn("Activity/Market data not available:", e));
+
+// Canonical "current/recent" parcel signal set. This is the ONE thing every
+// lead-facing surface that implies "this matters right now" must consume --
+// the ranked-list badge and the parcel-detail headline both had a real bug
+// where they instead read straight from activityByParcel (the FULL
+// historical record), so a parcel whose only activity was a 2018 transfer
+// showed a "recent"-looking badge/headline forever. Fixed windows here,
+// deliberately independent of whatever the Activity sidebar's pills
+// currently show -- that's a separate, interactive view (see
+// computeMapActiveParcels), not the parcel-level fact this represents.
+// activityByParcel / activity_events.json remains the complete historical
+// record and drives Activity History only.
+function computeCurrentSignalsByParcel() {
+  const byParcel = new Map(); // parcelId -> [{kind, event}]
+  const add = (parcelId, kind, event) => {
+    if (!byParcel.has(parcelId)) byParcel.set(parcelId, []);
+    byParcel.get(parcelId).push({ kind, event });
+  };
+
+  const transferCutoff = Date.now() - MAP_TRANSFER_DEFAULT_DAYS * 86400000;
+  for (const e of activityEvents) {
+    if ((TYPE_BUCKET[e.event_type] ?? "other") !== "transfer") continue;
+    const t = Date.parse(e.event_date);
+    if (Number.isNaN(t) || t < transferCutoff) continue;
+    add(e.parcel_id, "transfer", e);
+  }
+  for (const [parcelId, info] of delinquentActiveByParcel) {
+    // Only matched/canonical parcels are addressable on a ranked-list row
+    // or a parcel-detail panel -- see the same guard in
+    // currentDelinquencyPseudoEvents() for why unmatched county rows exist
+    // in delinquentActiveByParcel at all.
+    if (!indexById.has(parcelId)) continue;
+    const kind = recentlyChangedDelinquentParcels.has(parcelId) ? "delinquent_changed" : "delinquent";
+    add(parcelId, kind, {
+      parcel_id: parcelId, county: countyForParcelId(parcelId), event_type: "TAX_DELINQUENT",
+      amount: info.amount, event_date: null, detected_at: info.lastSeenAt, source_id: info.sourceId,
+    });
+  }
+  return byParcel;
+}
+
+let currentSignalsByParcel = new Map();
+function refreshCurrentSignals() {
+  currentSignalsByParcel = computeCurrentSignalsByParcel();
+}
 
 function daysAgoLabel(dateStr) {
   if (!dateStr) return null;
@@ -1238,27 +1293,36 @@ function daysAgoLabel(dateStr) {
 }
 
 function activityBadgeHtml(parcelId) {
-  const events = activityByParcel.get(parcelId);
-  if (!events || events.length === 0) return "";
-  const sorted = [...events].sort((a, b) => (b.event_date ?? "").localeCompare(a.event_date ?? ""));
-  const latest = sorted[0];
-  const bucket = TYPE_BUCKET[latest.event_type] ?? "other";
-  const label = bucket === "transfer" ? "Recent transfer" : bucket === "delinquent" ? "Tax delinquent" : latest.event_type.replaceAll("_", " ");
+  // Two distinct sections, per the Activity/history split: ACTIVE/RECENT
+  // uses the same canonical current-signal set as the map/ranked-list
+  // badge (fixed 90-day transfer window, persistent unresolved
+  // delinquency) -- NOT "whatever the newest historical event happens to
+  // be", which previously let a parcel's only-ever 2018 transfer render as
+  // if it were a live headline. ACTIVITY HISTORY is untouched: the
+  // complete record, nothing deleted, nothing hidden.
+  const currentSignals = currentSignalsByParcel.get(parcelId) ?? [];
+  const history = activityByParcel.get(parcelId) ?? [];
+  if (currentSignals.length === 0 && history.length === 0) return "";
 
-  const historyRows = sorted
-    .map((e) => activityEventCardHtml(e, { compact: true }))
-    .join("");
-
-  return `
+  const currentSection = currentSignals.length > 0 ? `
     <div class="activity-section">
-      <div class="activity-section-header">ACTIVITY <span class="muted">${events.length} signal${events.length === 1 ? "" : "s"}</span></div>
-      ${activityEventCardHtml(sorted[0], { compact: true })}
-      ${sorted.length > 1 ? `
-        <button type="button" class="text-button activity-history-toggle">View activity history →</button>
-        <div class="activity-history" hidden>${historyRows}</div>
-      ` : ""}
+      <div class="activity-section-header">ACTIVE / RECENT</div>
+      ${currentSignals.map((s) => activityEventCardHtml(s.event, { compact: true })).join("")}
     </div>
-  `;
+  ` : "";
+
+  const sortedHistory = [...history].sort((a, b) => (b.event_date ?? b.detected_at ?? "").localeCompare(a.event_date ?? a.detected_at ?? ""));
+  const historySection = sortedHistory.length > 0 ? `
+    <div class="activity-section">
+      <button type="button" class="text-button activity-history-toggle">View activity history →</button>
+      <div class="activity-history" hidden>
+        <div class="activity-section-header">ACTIVITY HISTORY</div>
+        ${sortedHistory.map((e) => activityEventCardHtml(e, { compact: true })).join("")}
+      </div>
+    </div>
+  ` : "";
+
+  return currentSection + historySection;
 }
 
 function wireActivityHistoryToggle(container) {
@@ -1372,8 +1436,9 @@ function renderActivityList() {
   const filtered = [...transferEvents, ...delinquentEvents];
   filtered.sort((a, b) => (b.event_date ?? b.detected_at ?? "").localeCompare(a.event_date ?? a.detected_at ?? ""));
 
+  const filteredParcelCount = new Set(filtered.map((e) => e.parcel_id)).size;
   document.querySelector("#activity-summary").textContent =
-    `${filtered.length} event${filtered.length === 1 ? "" : "s"} · ${new Set(filtered.map((e) => e.parcel_id)).size} parcels`;
+    `${filtered.length} signal${filtered.length === 1 ? "" : "s"} across ${filteredParcelCount} parcel${filteredParcelCount === 1 ? "" : "s"}`;
 
   const list = document.querySelector("#activity-list");
   list.innerHTML = filtered.slice(0, 200).map((e) => activityEventCardHtml(e, { withParcelContext: true })).join("");
