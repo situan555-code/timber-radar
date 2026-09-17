@@ -414,6 +414,7 @@ function openDetailPanel(row) {
   body.innerHTML = `
     <div class="detail-title">${row.parcel_id}</div>
     <div class="detail-sub">Score version ${row.score_version ?? "—"} · ${fmt((row.feature_coverage ?? 0) * 100, "%", 0)} feature coverage</div>
+    ${activityBadgeHtml(row.parcel_id)}
 
     <div class="score-hero">
       <div class="num" style="color:${scoreColorForValue(row.timber_score ?? 0)}">${row.timber_score ?? "—"}</div>
@@ -1066,3 +1067,85 @@ document.querySelector("#shortlist-export-csv").addEventListener("click", export
 document.querySelector("#shortlist-export-geojson").addEventListener("click", exportShortlistGeoJSON);
 
 saveShortlist(); // sync the count badge on load
+
+// --- Activity layer (prototype: parcel-detail badge + a filterable event
+// list, per docs/activity/ACTIVITY_AGENT_LOOP.md section 13). Deliberately
+// does not touch parcel-fill/timber_score in any way -- Activity is a
+// read-only overlay of what the Activity subsystem discovered, never an
+// input to it. ---
+const ACTIVITY_EVENTS_URL = "./public/data/activity_events.json";
+let activityEvents = [];
+let activityByParcel = new Map();
+
+fetch(ACTIVITY_EVENTS_URL)
+  .then((r) => (r.ok ? r.json() : { events: [] }))
+  .then((data) => {
+    activityEvents = data.events ?? [];
+    activityByParcel = new Map();
+    for (const e of activityEvents) {
+      if (!e.parcel_id) continue;
+      if (!activityByParcel.has(e.parcel_id)) activityByParcel.set(e.parcel_id, []);
+      activityByParcel.get(e.parcel_id).push(e);
+    }
+    const types = [...new Set(activityEvents.map((e) => e.event_type))].sort();
+    const typeSelect = document.querySelector("#activity-type");
+    for (const t of types) {
+      const opt = document.createElement("option");
+      opt.value = t;
+      opt.textContent = t.replaceAll("_", " ");
+      typeSelect.appendChild(opt);
+    }
+    renderActivityList();
+  })
+  .catch((e) => console.warn("Activity events not available:", e));
+
+function activityBadgeHtml(parcelId) {
+  const events = activityByParcel.get(parcelId);
+  if (!events || events.length === 0) return "";
+  const latest = events.reduce((a, b) => ((a.event_date ?? "") > (b.event_date ?? "") ? a : b));
+  return `<div class="activity-badge">⚡ ${events.length} activity event${events.length === 1 ? "" : "s"} · latest ${latest.event_date ?? "unknown date"} (${latest.event_type.replaceAll("_", " ")})</div>`;
+}
+
+function renderActivityList() {
+  const recencyDays = document.querySelector("#activity-recency").value;
+  const typeFilter = document.querySelector("#activity-type").value;
+  const cutoff = recencyDays === "all" ? null : Date.now() - Number(recencyDays) * 86400000;
+
+  const filtered = activityEvents.filter((e) => {
+    if (typeFilter !== "all" && e.event_type !== typeFilter) return false;
+    if (cutoff && e.event_date) {
+      const t = Date.parse(e.event_date);
+      if (!Number.isNaN(t) && t < cutoff) return false;
+    }
+    return true;
+  });
+
+  document.querySelector("#activity-summary").textContent =
+    `${filtered.length} event${filtered.length === 1 ? "" : "s"} · ${new Set(filtered.map((e) => e.parcel_id).filter(Boolean)).size} parcels`;
+
+  const list = document.querySelector("#activity-list");
+  list.innerHTML = filtered
+    .slice(0, 200)
+    .map(
+      (e) => `<div class="result-row activity-row" data-parcel-id="${e.parcel_id ?? ""}">
+        <div class="result-rank">${e.event_type.replaceAll("_", " ")}</div>
+        <div class="result-score">${e.event_date ?? "—"}</div>
+        <div class="result-sub">${e.parcel_id ?? "(unmatched)"} · ${e.county ?? ""}${e.amount != null ? " · $" + Math.round(e.amount).toLocaleString() : ""}</div>
+      </div>`
+    )
+    .join("");
+  list.querySelectorAll(".activity-row[data-parcel-id]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const pid = el.dataset.parcelId;
+      if (pid && indexById.has(pid)) selectParcel(pid, { fly: true });
+    });
+  });
+}
+
+document.querySelector("#activity-toggle").addEventListener("change", (e) => {
+  document.querySelector("#activity-body").hidden = !e.target.checked;
+  document.querySelector("#activity-chev").hidden = !e.target.checked;
+  if (e.target.checked) renderActivityList();
+});
+document.querySelector("#activity-recency").addEventListener("change", renderActivityList);
+document.querySelector("#activity-type").addEventListener("change", renderActivityList);

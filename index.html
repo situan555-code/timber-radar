@@ -57,6 +57,28 @@
         </div>
       </div>
 
+      <div id="activity" class="section">
+        <div class="section-header">
+          <label class="filter-check" style="margin:0"><input type="checkbox" id="activity-toggle" /> Activity</label>
+          <span class="chev" id="activity-chev" hidden>▾</span>
+        </div>
+        <div id="activity-body" class="section-body" hidden>
+          <label class="filter-row">Recency
+            <select id="activity-recency">
+              <option value="7">Last 7 days</option>
+              <option value="30" selected>Last 30 days</option>
+              <option value="90">Last 90 days</option>
+              <option value="all">All time</option>
+            </select>
+          </label>
+          <label class="filter-row">Event type
+            <select id="activity-type"><option value="all">All types</option></select>
+          </label>
+          <div class="muted" id="activity-summary"></div>
+          <div id="activity-list" class="ranked-list"></div>
+        </div>
+      </div>
+
       <div id="list-view" class="section grow">
         <div class="section-header static">
           <span id="result-count">5792 parcels</span>
