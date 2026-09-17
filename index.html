@@ -57,25 +57,48 @@
         </div>
       </div>
 
-      <div id="activity" class="section">
-        <div class="section-header">
-          <label class="filter-check" style="margin:0"><input type="checkbox" id="activity-toggle" /> Activity</label>
-          <span class="chev" id="activity-chev" hidden>▾</span>
+      <div id="signals" class="section">
+        <div class="section-header signals-header">
+          <div class="signals-tabs">
+            <button type="button" class="signals-tab" id="signals-tab-activity" data-view="activity">Activity</button>
+            <button type="button" class="signals-tab" id="signals-tab-market" data-view="market">Market</button>
+          </div>
         </div>
+
         <div id="activity-body" class="section-body" hidden>
-          <label class="filter-row">Recency
-            <select id="activity-recency">
-              <option value="7">Last 7 days</option>
-              <option value="30" selected>Last 30 days</option>
-              <option value="90">Last 90 days</option>
-              <option value="all">All time</option>
-            </select>
-          </label>
-          <label class="filter-row">Event type
-            <select id="activity-type"><option value="all">All types</option></select>
-          </label>
+          <div class="pill-row" id="activity-recency-pills">
+            <button type="button" class="pill-toggle" data-recency="7">7 days</button>
+            <button type="button" class="pill-toggle" data-recency="30">30 days</button>
+            <button type="button" class="pill-toggle" data-recency="90">90 days</button>
+            <button type="button" class="pill-toggle active" data-recency="all">All</button>
+          </div>
+          <div class="pill-row" id="activity-type-pills">
+            <button type="button" class="pill-toggle active" data-type="all">All</button>
+            <button type="button" class="pill-toggle" data-type="transfer">Transfer / Sale</button>
+            <button type="button" class="pill-toggle" data-type="delinquent">Tax delinquent</button>
+          </div>
+          <div class="pill-row" id="activity-county-pills">
+            <button type="button" class="pill-toggle active" data-county="all">All counties</button>
+            <button type="button" class="pill-toggle" data-county="Holmes">Holmes</button>
+            <button type="button" class="pill-toggle" data-county="Tuscarawas">Tuscarawas</button>
+          </div>
+          <button type="button" id="activity-more-filters-toggle" class="text-button">More filters ▾</button>
+          <div id="activity-more-filters" class="section-body" hidden>
+            <label class="filter-row">Min timber score
+              <input type="number" id="activity-min-score" min="0" max="100" value="0" />
+            </label>
+            <label class="filter-row">Min wooded acres
+              <input type="number" id="activity-min-wooded" min="0" value="0" />
+            </label>
+          </div>
           <div class="muted" id="activity-summary"></div>
-          <div id="activity-list" class="ranked-list"></div>
+          <div id="activity-list" class="activity-card-list"></div>
+          <div class="freshness-footer" id="activity-freshness"></div>
+        </div>
+
+        <div id="market-body" class="section-body" hidden>
+          <div id="market-prices"></div>
+          <div id="market-cutsold"></div>
         </div>
       </div>
 

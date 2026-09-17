@@ -353,10 +353,29 @@ function buildResultRow(row) {
         <span>continuity ${pct(row.largest_patch_share)}</span>
         <span class="status-chip ${statusClass}">${statusLabel}</span>
       </div>
+      ${resultRowActivityBadgeHtml(row.parcel_id)}
     </div>
   `;
   el.addEventListener("click", () => selectParcel(row.parcel_id, { fly: true }));
   return el;
+}
+
+function resultRowActivityBadgeHtml(parcelId) {
+  const events = activityByParcel.get(parcelId);
+  if (!events || events.length === 0) return "";
+  if (events.length > 1) {
+    return `<div class="row-activity-badge">● ${events.length} activity signals</div>`;
+  }
+  const e = events[0];
+  const bucket = TYPE_BUCKET[e.event_type] ?? "other";
+  if (bucket === "transfer") {
+    const ago = daysAgoLabel(e.event_date);
+    return `<div class="row-activity-badge">● Transfer${ago ? " " + ago.replace(" ago", "").replace(" days", "d").replace(" day", "d") : ""}</div>`;
+  }
+  if (bucket === "delinquent") {
+    return `<div class="row-activity-badge">● ${e.event_type === "TAX_DELINQUENCY_CLEARED" ? "Delinquency cleared" : "Tax delinquent"}</div>`;
+  }
+  return "";
 }
 
 async function selectParcel(parcelId, { fly = false } = {}) {
@@ -447,6 +466,10 @@ function openDetailPanel(row) {
   document.querySelector("#detail-shortlist-toggle").addEventListener("click", () => {
     toggleShortlist(row.parcel_id);
     openDetailPanel(row);
+  });
+  wireActivityHistoryToggle(body);
+  body.querySelectorAll(".activity-card[data-parcel-id]").forEach((el) => {
+    el.addEventListener("click", (ev) => ev.stopPropagation());
   });
 }
 
@@ -749,6 +772,25 @@ map.on("load", () => {
     paint: { "line-color": "#f8fafc", "line-width": 3.5 },
   });
 
+  // Activity indicator: an independent halo dot at each parcel with >=1
+  // activity event. Deliberately a separate source/layer rather than a
+  // feature-state join on parcel-fill -- Timber Score's fill color must
+  // never change based on Activity, per the product model.
+  map.addSource("activity-indicator", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+  map.addLayer({
+    id: "activity-indicator-layer",
+    type: "circle",
+    source: "activity-indicator",
+    paint: {
+      "circle-radius": ["interpolate", ["linear"], ["zoom"], 10, 3, 14, 5, 17, 7],
+      "circle-color": "#f97316",
+      "circle-stroke-color": "#0b0d0c",
+      "circle-stroke-width": 1.5,
+      "circle-opacity": 0.9,
+    },
+  });
+  buildActivityIndicatorLayer();
+
   map.addSource("roads", { type: "geojson", data: ROADS_URL });
   map.addLayer({
     id: "roads-line",
@@ -976,6 +1018,11 @@ fetch(INDEX_URL)
     performance.mark("app:list-rendered"); // E05.10.B timing
     renderShortlistDrawer();
     saveShortlist();
+    // Activity/Market may have already rendered with an incomplete
+    // indexById if that fetch resolved first; re-render now that parcel
+    // context (score/wooded acres) is available for the join.
+    buildActivityIndicatorLayer();
+    if (signalsView === "activity") renderActivityList();
   });
 
 // Layer toggles
@@ -1068,84 +1115,348 @@ document.querySelector("#shortlist-export-geojson").addEventListener("click", ex
 
 saveShortlist(); // sync the count badge on load
 
-// --- Activity layer (prototype: parcel-detail badge + a filterable event
-// list, per docs/activity/ACTIVITY_AGENT_LOOP.md section 13). Deliberately
-// does not touch parcel-fill/timber_score in any way -- Activity is a
-// read-only overlay of what the Activity subsystem discovered, never an
-// input to it. ---
+// --- Activity + Market (docs/activity/ACTIVITY_AGENT_LOOP.md section 13,
+// refined per product-model feedback: Timber Score = what's on the land,
+// Activity = what's happening to a specific parcel, Market = what's
+// happening regionally. These are never blended -- Activity/Market data
+// never touches parcel-fill color or timber_score itself. ---
 const ACTIVITY_EVENTS_URL = "./public/data/activity_events.json";
+const MARKET_OBSERVATIONS_URL = "./public/data/market_observations.json";
+const TIMBER_SALES_URL = "./public/data/timber_sales.json";
+
+const SOURCE_LABELS = {
+  tusc_delinquent: "Tuscarawas County Treasurer",
+  holmes_delinquent: "Holmes County Treasurer",
+  holmes_bulk_records: "Holmes County public records",
+  ohio_timber_prices: "Ohio Timber Price Report (OSU Extension / USFS)",
+  usfs_cut_sold_r09: "USFS Cut & Sold, Region 9",
+};
+
+// Raw event_type -> the 2-bucket taxonomy the product actually asks for.
+// TAX_DELINQUENCY_CLEARED still counts as a "tax delinquent" signal (a
+// parcel's delinquency status just changed), it's simply rendered as
+// "Cleared" rather than a current balance.
+const TYPE_BUCKET = {
+  TRANSFER_RECORDED: "transfer",
+  TAX_DELINQUENT: "delinquent",
+  TAX_DELINQUENCY_INCREASED: "delinquent",
+  TAX_DELINQUENCY_DECREASED: "delinquent",
+  TAX_DELINQUENCY_CLEARED: "delinquent",
+};
+
 let activityEvents = [];
 let activityByParcel = new Map();
+let marketObservations = [];
+let signalsView = null; // null | "activity" | "market"
 
-fetch(ACTIVITY_EVENTS_URL)
-  .then((r) => (r.ok ? r.json() : { events: [] }))
-  .then((data) => {
-    activityEvents = data.events ?? [];
+Promise.all([
+  fetch(ACTIVITY_EVENTS_URL).then((r) => (r.ok ? r.json() : { events: [] })),
+  fetch(MARKET_OBSERVATIONS_URL).then((r) => (r.ok ? r.json() : { observations: [] })),
+  fetch(TIMBER_SALES_URL).then((r) => (r.ok ? r.json() : { sales: [] })),
+])
+  .then(([activityData, marketData, salesData]) => {
+    // parcel_id here is always a canonical id from the same OGRIP AOI
+    // parcel set indexById loads separately, so it's safe to keep every
+    // matched event without waiting on indexById -- per-row context (score,
+    // wooded acres) is looked up lazily at render time instead.
+    activityEvents = (activityData.events ?? []).filter((e) => e.parcel_id);
     activityByParcel = new Map();
     for (const e of activityEvents) {
-      if (!e.parcel_id) continue;
       if (!activityByParcel.has(e.parcel_id)) activityByParcel.set(e.parcel_id, []);
       activityByParcel.get(e.parcel_id).push(e);
     }
-    const types = [...new Set(activityEvents.map((e) => e.event_type))].sort();
-    const typeSelect = document.querySelector("#activity-type");
-    for (const t of types) {
-      const opt = document.createElement("option");
-      opt.value = t;
-      opt.textContent = t.replaceAll("_", " ");
-      typeSelect.appendChild(opt);
-    }
-    renderActivityList();
+    marketObservations = marketData.observations ?? [];
+
+    // Per the "zero data = section disappears" rule: only show the Signals
+    // tab bar at all if there's something to show, and only show the
+    // Market tab if timber_sales/market_observations actually has rows.
+    const hasActivity = activityEvents.length > 0;
+    const hasMarket = marketObservations.length > 0;
+    document.querySelector("#signals-tab-activity").hidden = !hasActivity;
+    document.querySelector("#signals-tab-market").hidden = !hasMarket;
+    document.querySelector("#signals").hidden = !hasActivity && !hasMarket;
+    // timber_sales.json (SAM/FACTS) is intentionally not surfaced anywhere
+    // in the UI while it has zero rows; salesData is fetched only so this
+    // stays wired up and starts populating automatically the moment a real
+    // sale/opportunity record exists, with no code change needed.
+    void salesData;
+
+    buildActivityIndicatorLayer();
+    if (hasActivity) renderActivityList();
+    if (hasMarket) renderMarketPanel();
+    if (hasActivity && parcelIndex.length > 0) renderList(); // pick up per-row activity badges
   })
-  .catch((e) => console.warn("Activity events not available:", e));
+  .catch((e) => console.warn("Activity/Market data not available:", e));
+
+function daysAgoLabel(dateStr) {
+  if (!dateStr) return null;
+  const t = Date.parse(dateStr);
+  if (Number.isNaN(t)) return null;
+  const days = Math.round((Date.now() - t) / 86400000);
+  if (days < 0) return "upcoming";
+  if (days === 0) return "today";
+  if (days === 1) return "1 day ago";
+  if (days <= 365) return `${days} days ago`;
+  // Beyond a year, a raw day count stops being a readable "recency" signal
+  // -- show the actual date instead (still useful for old transfer history).
+  return dateStr;
+}
 
 function activityBadgeHtml(parcelId) {
   const events = activityByParcel.get(parcelId);
   if (!events || events.length === 0) return "";
-  const latest = events.reduce((a, b) => ((a.event_date ?? "") > (b.event_date ?? "") ? a : b));
-  return `<div class="activity-badge">⚡ ${events.length} activity event${events.length === 1 ? "" : "s"} · latest ${latest.event_date ?? "unknown date"} (${latest.event_type.replaceAll("_", " ")})</div>`;
+  const sorted = [...events].sort((a, b) => (b.event_date ?? "").localeCompare(a.event_date ?? ""));
+  const latest = sorted[0];
+  const bucket = TYPE_BUCKET[latest.event_type] ?? "other";
+  const label = bucket === "transfer" ? "Recent transfer" : bucket === "delinquent" ? "Tax delinquent" : latest.event_type.replaceAll("_", " ");
+
+  const historyRows = sorted
+    .map((e) => activityEventCardHtml(e, { compact: true }))
+    .join("");
+
+  return `
+    <div class="activity-section">
+      <div class="activity-section-header">ACTIVITY <span class="muted">${events.length} signal${events.length === 1 ? "" : "s"}</span></div>
+      ${activityEventCardHtml(sorted[0], { compact: true })}
+      ${sorted.length > 1 ? `
+        <button type="button" class="text-button activity-history-toggle">View activity history →</button>
+        <div class="activity-history" hidden>${historyRows}</div>
+      ` : ""}
+    </div>
+  `;
+}
+
+function wireActivityHistoryToggle(container) {
+  const btn = container.querySelector(".activity-history-toggle");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const hist = container.querySelector(".activity-history");
+    hist.hidden = !hist.hidden;
+    btn.textContent = hist.hidden ? "View activity history →" : "Hide activity history ↑";
+  });
+}
+
+// Compact card used both in the parcel detail panel and (with parcel
+// context added) in the Activity feed list.
+function activityEventCardHtml(e, { compact = false, withParcelContext = false } = {}) {
+  const bucket = TYPE_BUCKET[e.event_type] ?? "other";
+  const isTransfer = bucket === "transfer";
+  const ago = daysAgoLabel(e.event_date);
+  const rightLabel = e.event_type === "TAX_DELINQUENCY_CLEARED" ? "Cleared" : e.event_type.startsWith("TAX_DELINQUENT") || e.event_type.startsWith("TAX_DELINQUENCY") ? (ago ?? "Current") : (ago ?? e.event_date ?? "");
+  const titleLabel = isTransfer ? "RECENT TRANSFER" : e.event_type === "TAX_DELINQUENCY_CLEARED" ? "DELINQUENCY CLEARED" : "TAX DELINQUENT";
+  const sourceLabel = SOURCE_LABELS[e.source_id] ?? e.source_id;
+  const row = indexById.get(e.parcel_id);
+
+  const fields = [];
+  if (isTransfer) {
+    fields.push(["Sale amount", e.amount != null && e.amount > 0 ? `$${Math.round(e.amount).toLocaleString()}` : "Not disclosed"]);
+  } else if (e.event_type !== "TAX_DELINQUENCY_CLEARED") {
+    fields.push(["Delinquent amount", e.amount != null ? `$${Math.round(e.amount).toLocaleString()}` : "—"]);
+  }
+  fields.push(["County", e.county ?? "—"]);
+  if (withParcelContext && row) {
+    fields.push(["Timber Score", row.timber_score ?? "—"]);
+    fields.push(["Wooded", fmt(row.wooded_acres, " ac")]);
+    if (isTransfer) fields.push(["Canopy p90", fmt(row.canopy_p90_ft, " ft")]);
+  }
+
+  return `
+    <div class="activity-card${compact ? " compact" : ""}" data-parcel-id="${e.parcel_id}">
+      <div class="activity-card-top">
+        <span class="activity-card-title ${bucket}">${titleLabel}</span>
+        <span class="activity-card-when">${rightLabel}</span>
+      </div>
+      <div class="activity-card-parcel">Parcel ${e.parcel_id}</div>
+      <dl class="activity-card-fields">
+        ${fields.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("")}
+      </dl>
+      <div class="activity-card-source">Source: ${sourceLabel}</div>
+    </div>
+  `;
 }
 
 function renderActivityList() {
-  const recencyDays = document.querySelector("#activity-recency").value;
-  const typeFilter = document.querySelector("#activity-type").value;
-  const cutoff = recencyDays === "all" ? null : Date.now() - Number(recencyDays) * 86400000;
+  const recency = document.querySelector("#activity-recency-pills .pill-toggle.active")?.dataset.recency ?? "all";
+  const typeFilter = document.querySelector("#activity-type-pills .pill-toggle.active")?.dataset.type ?? "all";
+  const countyFilter = document.querySelector("#activity-county-pills .pill-toggle.active")?.dataset.county ?? "all";
+  const minScore = Number(document.querySelector("#activity-min-score")?.value || 0);
+  const minWooded = Number(document.querySelector("#activity-min-wooded")?.value || 0);
+  const cutoff = recency === "all" ? null : Date.now() - Number(recency) * 86400000;
 
   const filtered = activityEvents.filter((e) => {
-    if (typeFilter !== "all" && e.event_type !== typeFilter) return false;
+    const bucket = TYPE_BUCKET[e.event_type] ?? "other";
+    if (typeFilter !== "all" && bucket !== typeFilter) return false;
+    if (countyFilter !== "all" && e.county !== countyFilter) return false;
     if (cutoff && e.event_date) {
       const t = Date.parse(e.event_date);
       if (!Number.isNaN(t) && t < cutoff) return false;
     }
+    if (minScore > 0 || minWooded > 0) {
+      const row = indexById.get(e.parcel_id);
+      if (!row) return false;
+      if (minScore > 0 && (row.timber_score ?? 0) < minScore) return false;
+      if (minWooded > 0 && (row.wooded_acres ?? 0) < minWooded) return false;
+    }
     return true;
   });
+  filtered.sort((a, b) => (b.event_date ?? "").localeCompare(a.event_date ?? ""));
 
   document.querySelector("#activity-summary").textContent =
-    `${filtered.length} event${filtered.length === 1 ? "" : "s"} · ${new Set(filtered.map((e) => e.parcel_id).filter(Boolean)).size} parcels`;
+    `${filtered.length} event${filtered.length === 1 ? "" : "s"} · ${new Set(filtered.map((e) => e.parcel_id)).size} parcels`;
 
   const list = document.querySelector("#activity-list");
-  list.innerHTML = filtered
-    .slice(0, 200)
-    .map(
-      (e) => `<div class="result-row activity-row" data-parcel-id="${e.parcel_id ?? ""}">
-        <div class="result-rank">${e.event_type.replaceAll("_", " ")}</div>
-        <div class="result-score">${e.event_date ?? "—"}</div>
-        <div class="result-sub">${e.parcel_id ?? "(unmatched)"} · ${e.county ?? ""}${e.amount != null ? " · $" + Math.round(e.amount).toLocaleString() : ""}</div>
-      </div>`
-    )
-    .join("");
-  list.querySelectorAll(".activity-row[data-parcel-id]").forEach((el) => {
+  list.innerHTML = filtered.slice(0, 200).map((e) => activityEventCardHtml(e, { withParcelContext: true })).join("");
+  list.querySelectorAll(".activity-card[data-parcel-id]").forEach((el) => {
     el.addEventListener("click", () => {
       const pid = el.dataset.parcelId;
       if (pid && indexById.has(pid)) selectParcel(pid, { fly: true });
     });
   });
+
+  // Freshness footer: latest detected_at per source actually present in
+  // the (unfiltered) event set, so an old feed can't look current merely
+  // because the app loaded today.
+  const bySource = new Map();
+  for (const e of activityEvents) {
+    const prev = bySource.get(e.source_id);
+    if (!prev || (e.detected_at ?? "") > prev) bySource.set(e.source_id, e.detected_at);
+  }
+  document.querySelector("#activity-freshness").innerHTML = [...bySource.entries()]
+    .map(([sid, ts]) => `<div>${SOURCE_LABELS[sid] ?? sid} · updated ${ts ? ts.slice(0, 10) : "—"}</div>`)
+    .join("");
 }
 
-document.querySelector("#activity-toggle").addEventListener("change", (e) => {
-  document.querySelector("#activity-body").hidden = !e.target.checked;
-  document.querySelector("#activity-chev").hidden = !e.target.checked;
-  if (e.target.checked) renderActivityList();
+// --- Market panel: Ohio Timber Price Report + Wayne NF Cut & Sold. Kept
+// entirely separate from Activity -- these are regional/species price
+// signals, not parcel events, and must never be implied to set a specific
+// parcel's value. ---
+function renderMarketPanel() {
+  const pricesEl = document.querySelector("#market-prices");
+  const cutSoldEl = document.querySelector("#market-cutsold");
+
+  const priceRows = marketObservations.filter((o) => o.source_id === "ohio_timber_prices");
+  if (priceRows.length === 0) {
+    pricesEl.innerHTML = "";
+  } else {
+    const periods = [...new Set(priceRows.map((o) => o.period_label))];
+    const latestPeriod = periods[0];
+    const bySpeciesGrade = new Map();
+    for (const o of priceRows) {
+      if (o.period_label !== latestPeriod) continue;
+      const key = `${o.species}|${o.grade ?? ""}|${o.region ?? ""}`;
+      if (!bySpeciesGrade.has(key)) bySpeciesGrade.set(key, {});
+      bySpeciesGrade.get(key)[o.metric] = o;
+    }
+    // "Stumpage" vs "delivered" per the mock -- this report only measures
+    // saw-log (delivered/mill-scale) and stumpage prices, no single
+    // combined table is fabricated; each metric only shows what exists.
+    const stumpageRows = [...bySpeciesGrade.entries()].filter(([k, v]) => v.stumpage_price_mean && (v.stumpage_price_mean.region === "State"));
+    const sawlogRows = [...bySpeciesGrade.entries()].filter(([k, v]) => v.saw_log_price_mean && (v.saw_log_price_mean.grade === "All grades"));
+
+    pricesEl.innerHTML = `
+      <div class="market-section-title">OHIO TIMBER PRICES</div>
+      <div class="muted market-period">Latest report: ${latestPeriod}</div>
+      ${sawlogRows.length ? `
+        <div class="market-table-label">Delivered saw logs ($/MBF Doyle, all grades)</div>
+        <table class="market-table">
+          <thead><tr><th>Species</th><th>Mean</th><th>Median</th></tr></thead>
+          <tbody>
+            ${sawlogRows.map(([k, v]) => `<tr><td>${v.saw_log_price_mean.species}</td><td>${fmtUsd(v.saw_log_price_mean.value)}</td><td>${fmtUsd(v.saw_log_price_median?.value)}</td></tr>`).join("")}
+          </tbody>
+        </table>` : ""}
+      ${stumpageRows.length ? `
+        <div class="market-table-label">Stumpage, statewide ($/MBF Doyle)</div>
+        <table class="market-table">
+          <thead><tr><th>Species</th><th>Mean</th><th>Median</th></tr></thead>
+          <tbody>
+            ${stumpageRows.map(([k, v]) => `<tr><td>${v.stumpage_price_mean.species}</td><td>${fmtUsd(v.stumpage_price_mean.value)}</td><td>${fmtUsd(v.stumpage_price_median?.value)}</td></tr>`).join("")}
+          </tbody>
+        </table>` : ""}
+    `;
+  }
+
+  const cutSoldRows = marketObservations.filter((o) => o.source_id === "usfs_cut_sold_r09");
+  if (cutSoldRows.length === 0) {
+    cutSoldEl.innerHTML = "";
+  } else {
+    const period = cutSoldRows[0].period_label;
+    const byMetric = Object.fromEntries(cutSoldRows.map((o) => [o.metric, o.value]));
+    cutSoldEl.innerHTML = `
+      <div class="market-section-title">WAYNE NATIONAL FOREST — CUT &amp; SOLD</div>
+      <div class="muted market-period">Report period: ${period}</div>
+      <div class="market-caution">Regional USFS context -- not a determinant of any specific private parcel's value.</div>
+      <dl class="detail-metrics">
+        <div><dt>Timber sold</dt><dd>${fmtNum(byMetric.cutsold_forest_sold_volume_mbf)} MBF</dd></div>
+        <div><dt>Sold value</dt><dd>${fmtUsd(byMetric.cutsold_forest_sold_value_usd)}</dd></div>
+        <div><dt>Timber cut</dt><dd>${fmtNum(byMetric.cutsold_forest_cut_volume_mbf)} MBF</dd></div>
+        <div><dt>Cut value</dt><dd>${fmtUsd(byMetric.cutsold_forest_cut_value_usd)}</dd></div>
+        ${byMetric.cutsold_forest_number_of_sales != null ? `<div><dt>Number of sales</dt><dd>${fmtNum(byMetric.cutsold_forest_number_of_sales)}</dd></div>` : ""}
+      </dl>
+    `;
+  }
+}
+
+function fmtUsd(v) {
+  return v == null ? "—" : `$${Math.round(v).toLocaleString()}`;
+}
+function fmtNum(v) {
+  return v == null ? "—" : Math.round(v).toLocaleString();
+}
+
+// --- Map indicator: an independent visual treatment (small halo dot), never
+// a replacement for the Timber Score fill color. ---
+function buildActivityIndicatorLayer() {
+  const features = [...activityByParcel.keys()]
+    .map((pid) => indexById.get(pid))
+    .filter((row) => row && row.centroid_lon != null)
+    .map((row) => ({
+      type: "Feature",
+      properties: { parcel_id: row.parcel_id },
+      geometry: { type: "Point", coordinates: [row.centroid_lon, row.centroid_lat] },
+    }));
+  const src = map.getSource("activity-indicator");
+  if (src) src.setData({ type: "FeatureCollection", features });
+}
+
+document.querySelectorAll(".signals-tab").forEach((tab) => {
+  tab.addEventListener("click", () => {
+    const view = tab.dataset.view;
+    signalsView = signalsView === view ? null : view;
+    document.querySelectorAll(".signals-tab").forEach((t) => t.classList.toggle("active", t.dataset.view === signalsView));
+    document.querySelector("#activity-body").hidden = signalsView !== "activity";
+    document.querySelector("#market-body").hidden = signalsView !== "market";
+    // The map's activity-indicator-layer stays visible regardless of which
+    // (or whether any) sidebar tab is open -- it's an ambient, always-on
+    // treatment, not something the Activity panel gates.
+    if (signalsView === "activity") renderActivityList();
+    if (signalsView === "market") renderMarketPanel();
+  });
 });
-document.querySelector("#activity-recency").addEventListener("change", renderActivityList);
-document.querySelector("#activity-type").addEventListener("change", renderActivityList);
+
+document.querySelectorAll("#activity-recency-pills .pill-toggle").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#activity-recency-pills .pill-toggle").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    renderActivityList();
+  });
+});
+document.querySelectorAll("#activity-type-pills .pill-toggle").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#activity-type-pills .pill-toggle").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    renderActivityList();
+  });
+});
+document.querySelectorAll("#activity-county-pills .pill-toggle").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#activity-county-pills .pill-toggle").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    renderActivityList();
+  });
+});
+document.querySelector("#activity-min-score")?.addEventListener("input", renderActivityList);
+document.querySelector("#activity-min-wooded")?.addEventListener("input", renderActivityList);
+document.querySelector("#activity-more-filters-toggle").addEventListener("click", () => {
+  const body = document.querySelector("#activity-more-filters");
+  body.hidden = !body.hidden;
+});
