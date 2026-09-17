@@ -2,6 +2,13 @@
 // shortlist workflow over the 5792-parcel enriched dataset, delivered as
 // static files (PMTiles vector tiles + a lightweight attribute index).
 
+import {
+  TYPE_BUCKET,
+  buildRecentlyChangedDelinquentSet,
+  delinquencyKind,
+  transferIsWithinWindow,
+} from "./activity-signals.js";
+
 const AOI_BBOX = [-81.80, 40.40, -81.65, 40.55]; // [west, south, east, north], matches config/pilot.yaml
 const PARCELS_PMTILES_URL = "./public/data/timber_parcels.pmtiles";
 const CHM_PMTILES_URL = "./public/data/chm.pmtiles";
@@ -1148,17 +1155,10 @@ const SOURCE_LABELS = {
   usfs_cut_sold_r09: "USFS Cut & Sold, Region 9",
 };
 
-// Raw event_type -> the 2-bucket taxonomy the product actually asks for.
-// TAX_DELINQUENCY_CLEARED still counts as a "tax delinquent" signal (a
-// parcel's delinquency status just changed), it's simply rendered as
-// "Cleared" rather than a current balance.
-const TYPE_BUCKET = {
-  TRANSFER_RECORDED: "transfer",
-  TAX_DELINQUENT: "delinquent",
-  TAX_DELINQUENCY_INCREASED: "delinquent",
-  TAX_DELINQUENCY_DECREASED: "delinquent",
-  TAX_DELINQUENCY_CLEARED: "delinquent",
-};
+// TYPE_BUCKET is imported from ./activity-signals.js (shared with
+// computeCurrentSignalsByParcel/computeMapActiveParcels/renderActivityList,
+// which now all go through that module's helpers instead of
+// reimplementing the transfer-window/delinquency-kind rules independently).
 
 let activityEvents = [];
 let activityByParcel = new Map();
@@ -1195,21 +1195,11 @@ Promise.all([
       if (s.active !== 1 || !s.state_type?.startsWith("delinquent_")) continue;
       delinquentActiveByParcel.set(s.parcel_id, { amount: s.amount, lastSeenAt: s.last_seen_at, sourceId: s.source_id });
     }
-    // IMPORTANT: this must use e.detected_at (when Timber Radar's own
-    // pipeline run observed the change), NOT e.event_date. event_date for
-    // a delinquency diff event is the underlying tax-year date
-    // (e.g. "2025-01-01"), which is not when the change was detected --
-    // using it here would make "changed in the last 30 days" fire based on
-    // which calendar year a tax roll covers, not on real recency. detected_at
-    // is an ISO timestamp (unlike event_date's YYYY-MM-DD), so compare it
-    // directly rather than through Date.parse's looser date-only handling.
-    const changeCutoffIso = new Date(Date.now() - RECENT_CHANGE_WINDOW_DAYS * 86400000).toISOString();
-    recentlyChangedDelinquentParcels = new Set(
-      activityEvents
-        .filter((e) => (e.event_type === "TAX_DELINQUENCY_INCREASED" || e.event_type === "TAX_DELINQUENCY_DECREASED"))
-        .filter((e) => e.detected_at && e.detected_at >= changeCutoffIso)
-        .map((e) => e.parcel_id)
-    );
+    // Resolves changed_at ?? detected_at ?? last_seen_at per event (never
+    // event_date, the tax-year date) via activity-signals.js's
+    // buildRecentlyChangedDelinquentSet -- the single implementation of
+    // this rule, instead of a third inline copy of the same date logic.
+    recentlyChangedDelinquentParcels = buildRecentlyChangedDelinquentSet(activityEvents, RECENT_CHANGE_WINDOW_DAYS);
 
     // Per the "zero data = section disappears" rule: only show the Signals
     // tab bar at all if there's something to show, and only show the
@@ -1251,11 +1241,9 @@ function computeCurrentSignalsByParcel() {
     byParcel.get(parcelId).push({ kind, event });
   };
 
-  const transferCutoff = Date.now() - MAP_TRANSFER_DEFAULT_DAYS * 86400000;
   for (const e of activityEvents) {
     if ((TYPE_BUCKET[e.event_type] ?? "other") !== "transfer") continue;
-    const t = Date.parse(e.event_date);
-    if (Number.isNaN(t) || t < transferCutoff) continue;
+    if (!transferIsWithinWindow(e, MAP_TRANSFER_DEFAULT_DAYS)) continue;
     add(e.parcel_id, "transfer", e);
   }
   for (const [parcelId, info] of delinquentActiveByParcel) {
@@ -1264,7 +1252,7 @@ function computeCurrentSignalsByParcel() {
     // currentDelinquencyPseudoEvents() for why unmatched county rows exist
     // in delinquentActiveByParcel at all.
     if (!indexById.has(parcelId)) continue;
-    const kind = recentlyChangedDelinquentParcels.has(parcelId) ? "delinquent_changed" : "delinquent";
+    const kind = delinquencyKind(parcelId, delinquentActiveByParcel, recentlyChangedDelinquentParcels);
     add(parcelId, kind, {
       parcel_id: parcelId, county: countyForParcelId(parcelId), event_type: "TAX_DELINQUENT",
       amount: info.amount, event_date: null, detected_at: info.lastSeenAt, source_id: info.sourceId,
@@ -1407,7 +1395,7 @@ function renderActivityList() {
   const countyFilter = document.querySelector("#activity-county-pills .pill-toggle.active")?.dataset.county ?? "all";
   const minScore = Number(document.querySelector("#activity-min-score")?.value || 0);
   const minWooded = Number(document.querySelector("#activity-min-wooded")?.value || 0);
-  const cutoff = recency === "all" ? null : Date.now() - Number(recency) * 86400000;
+  const recencyDays = recency === "all" ? null : Number(recency);
 
   const passesCommon = (e) => {
     if (countyFilter !== "all" && e.county !== countyFilter) return false;
@@ -1423,11 +1411,11 @@ function renderActivityList() {
   const transferEvents = typeFilter === "delinquent" ? [] : activityEvents.filter((e) => {
     if ((TYPE_BUCKET[e.event_type] ?? "other") !== "transfer") return false;
     if (!passesCommon(e)) return false;
-    if (cutoff && e.event_date) {
-      const t = Date.parse(e.event_date);
-      if (!Number.isNaN(t) && t < cutoff) return false;
-    }
-    return true;
+    // Same helper the map uses: under a finite recency window, a missing
+    // or malformed event_date is excluded here too, instead of the feed's
+    // old `if (cutoff && e.event_date)` guard letting an undated transfer
+    // through where the map's Date.parse check would have dropped it.
+    return transferIsWithinWindow(e, recencyDays);
   });
   // Delinquency is a persistent condition, not a dated event -- it isn't
   // gated by the recency pill (matches computeMapActiveParcels).
@@ -1569,7 +1557,7 @@ function computeMapActiveParcels() {
   const countyFilter = document.querySelector("#activity-county-pills .pill-toggle.active")?.dataset.county ?? "all";
   const minScore = Number(document.querySelector("#activity-min-score")?.value || 0);
   const minWooded = Number(document.querySelector("#activity-min-wooded")?.value || 0);
-  const cutoff = recency === "all" ? null : Date.now() - Number(recency) * 86400000;
+  const recencyDays = recency === "all" ? null : Number(recency);
 
   const passesContext = (parcelId, county) => {
     if (countyFilter !== "all" && county !== countyFilter) return false;
@@ -1588,16 +1576,16 @@ function computeMapActiveParcels() {
     for (const [parcelId] of delinquentActiveByParcel) {
       const row = indexById.get(parcelId);
       if (!row || !passesContext(parcelId, countyForParcelId(parcelId))) continue;
-      kindByParcel.set(parcelId, recentlyChangedDelinquentParcels.has(parcelId) ? "delinquent_changed" : "delinquent");
+      kindByParcel.set(parcelId, delinquencyKind(parcelId, delinquentActiveByParcel, recentlyChangedDelinquentParcels));
     }
   }
   if (typeFilter === "all" || typeFilter === "transfer") {
     for (const e of activityEvents) {
       if ((TYPE_BUCKET[e.event_type] ?? "other") !== "transfer") continue;
-      if (cutoff) {
-        const t = Date.parse(e.event_date);
-        if (Number.isNaN(t) || t < cutoff) continue;
-      }
+      // Same shared helper as renderActivityList/computeCurrentSignalsByParcel:
+      // under a finite window, a missing/malformed event_date is excluded
+      // here too, so the map and feed can never disagree on that case.
+      if (!transferIsWithinWindow(e, recencyDays)) continue;
       if (!passesContext(e.parcel_id, e.county)) continue;
       if (kindByParcel.get(e.parcel_id) !== "delinquent_changed") kindByParcel.set(e.parcel_id, "transfer");
     }
