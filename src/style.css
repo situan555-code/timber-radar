@@ -177,6 +177,11 @@ body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; 
 .pill-toggle.active { background: rgba(103,232,249,.15); border-color: rgba(103,232,249,.5); color: #a5f3fc; }
 .pill-toggle:hover { color: #f8fafc; }
 
+.activity-map-legend { display: flex; flex-wrap: wrap; gap: 10px; padding: 4px 12px 0; font-size: 10px; color: var(--muted); }
+.activity-map-legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+.activity-map-legend .dot.transfer { background: #f97316; }
+.activity-map-legend .dot.delinquent { background: #f87171; }
+.activity-map-legend .dot.delinquent-changed { background: #facc15; }
 #activity-more-filters-toggle { margin: 8px 12px 0; }
 #activity-more-filters { padding: 4px 12px 8px; }
 #activity-summary { padding: 8px 12px 0; font-size: 12px; }

@@ -772,10 +772,13 @@ map.on("load", () => {
     paint: { "line-color": "#f8fafc", "line-width": 3.5 },
   });
 
-  // Activity indicator: an independent halo dot at each parcel with >=1
-  // activity event. Deliberately a separate source/layer rather than a
-  // feature-state join on parcel-fill -- Timber Score's fill color must
-  // never change based on Activity, per the product model.
+  // Activity indicator: an independent halo dot marking "currently active
+  // or recent" signals only (recent transfer, unresolved delinquency) --
+  // NOT every parcel with any activity history ever. See
+  // computeMapActiveParcels() for the actual current/recent logic.
+  // Deliberately a separate source/layer rather than a feature-state join
+  // on parcel-fill -- Timber Score's fill color must never change based on
+  // Activity, per the product model.
   map.addSource("activity-indicator", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
   map.addLayer({
     id: "activity-indicator-layer",
@@ -783,7 +786,13 @@ map.on("load", () => {
     source: "activity-indicator",
     paint: {
       "circle-radius": ["interpolate", ["linear"], ["zoom"], 10, 3, 14, 5, 17, 7],
-      "circle-color": "#f97316",
+      "circle-color": [
+        "match", ["get", "kind"],
+        "delinquent_changed", "#facc15",
+        "delinquent", "#f87171",
+        "transfer", "#f97316",
+        "#94a3b8",
+      ],
       "circle-stroke-color": "#0b0d0c",
       "circle-stroke-width": 1.5,
       "circle-opacity": 0.9,
@@ -1123,6 +1132,9 @@ saveShortlist(); // sync the count badge on load
 const ACTIVITY_EVENTS_URL = "./public/data/activity_events.json";
 const MARKET_OBSERVATIONS_URL = "./public/data/market_observations.json";
 const TIMBER_SALES_URL = "./public/data/timber_sales.json";
+const ACTIVITY_CURRENT_STATE_URL = "./public/data/activity_current_state.json";
+const RECENT_CHANGE_WINDOW_DAYS = 30; // "tax amount changed" sub-signal window
+const MAP_TRANSFER_DEFAULT_DAYS = 90;
 
 const SOURCE_LABELS = {
   tusc_delinquent: "Tuscarawas County Treasurer",
@@ -1148,13 +1160,20 @@ let activityEvents = [];
 let activityByParcel = new Map();
 let marketObservations = [];
 let signalsView = null; // null | "activity" | "market"
+// Ground truth for "is this parcel's delinquency still unresolved right
+// now" (activity_current_state.active=1), independent of how long ago the
+// last diff event happened -- this is what the map indicator uses for
+// delinquency, NOT a recency cutoff on activity_events.
+let delinquentActiveByParcel = new Map(); // parcel_id -> {amount, lastSeenAt}
+let recentlyChangedDelinquentParcels = new Set(); // amount changed within RECENT_CHANGE_WINDOW_DAYS
 
 Promise.all([
   fetch(ACTIVITY_EVENTS_URL).then((r) => (r.ok ? r.json() : { events: [] })),
   fetch(MARKET_OBSERVATIONS_URL).then((r) => (r.ok ? r.json() : { observations: [] })),
   fetch(TIMBER_SALES_URL).then((r) => (r.ok ? r.json() : { sales: [] })),
+  fetch(ACTIVITY_CURRENT_STATE_URL).then((r) => (r.ok ? r.json() : { state: [] })),
 ])
-  .then(([activityData, marketData, salesData]) => {
+  .then(([activityData, marketData, salesData, currentStateData]) => {
     // parcel_id here is always a canonical id from the same OGRIP AOI
     // parcel set indexById loads separately, so it's safe to keep every
     // matched event without waiting on indexById -- per-row context (score,
@@ -1166,6 +1185,22 @@ Promise.all([
       activityByParcel.get(e.parcel_id).push(e);
     }
     marketObservations = marketData.observations ?? [];
+
+    delinquentActiveByParcel = new Map();
+    for (const s of currentStateData.state ?? []) {
+      if (s.active !== 1 || !s.state_type?.startsWith("delinquent_")) continue;
+      delinquentActiveByParcel.set(s.parcel_id, { amount: s.amount, lastSeenAt: s.last_seen_at, sourceId: s.source_id });
+    }
+    const changeCutoff = Date.now() - RECENT_CHANGE_WINDOW_DAYS * 86400000;
+    recentlyChangedDelinquentParcels = new Set(
+      activityEvents
+        .filter((e) => (e.event_type === "TAX_DELINQUENCY_INCREASED" || e.event_type === "TAX_DELINQUENCY_DECREASED"))
+        .filter((e) => {
+          const t = Date.parse(e.event_date);
+          return !Number.isNaN(t) && t >= changeCutoff;
+        })
+        .map((e) => e.parcel_id)
+    );
 
     // Per the "zero data = section disappears" rule: only show the Signals
     // tab bar at all if there's something to show, and only show the
@@ -1275,22 +1310,43 @@ function activityEventCardHtml(e, { compact = false, withParcelContext = false }
   `;
 }
 
+// Synthesizes one "currently delinquent" card per parcel from
+// activity_current_state, rather than replaying every historical
+// increased/decreased diff event -- this is what keeps the feed's
+// "Tax delinquent" view answering "what's true right now" the same way
+// the map does, instead of the two disagreeing on the same filter bar.
+function currentDelinquencyPseudoEvents() {
+  const out = [];
+  for (const [parcelId, info] of delinquentActiveByParcel) {
+    // activity_current_state also carries county-wide rows this pilot's
+    // canonical parcel set doesn't cover (the delinquency lists are
+    // county-wide, the AOI is a small slice of each county) -- those are
+    // real data but not actionable here (can't fly to them or join score/
+    // wooded acres), so only surface matched/canonical parcels.
+    if (!indexById.has(parcelId)) continue;
+    out.push({
+      parcel_id: parcelId,
+      county: countyForParcelId(parcelId),
+      event_type: "TAX_DELINQUENT",
+      amount: info.amount,
+      event_date: null,
+      detected_at: info.lastSeenAt,
+      source_id: info.sourceId,
+    });
+  }
+  return out;
+}
+
 function renderActivityList() {
-  const recency = document.querySelector("#activity-recency-pills .pill-toggle.active")?.dataset.recency ?? "all";
+  const recency = document.querySelector("#activity-recency-pills .pill-toggle.active")?.dataset.recency ?? "90";
   const typeFilter = document.querySelector("#activity-type-pills .pill-toggle.active")?.dataset.type ?? "all";
   const countyFilter = document.querySelector("#activity-county-pills .pill-toggle.active")?.dataset.county ?? "all";
   const minScore = Number(document.querySelector("#activity-min-score")?.value || 0);
   const minWooded = Number(document.querySelector("#activity-min-wooded")?.value || 0);
   const cutoff = recency === "all" ? null : Date.now() - Number(recency) * 86400000;
 
-  const filtered = activityEvents.filter((e) => {
-    const bucket = TYPE_BUCKET[e.event_type] ?? "other";
-    if (typeFilter !== "all" && bucket !== typeFilter) return false;
+  const passesCommon = (e) => {
     if (countyFilter !== "all" && e.county !== countyFilter) return false;
-    if (cutoff && e.event_date) {
-      const t = Date.parse(e.event_date);
-      if (!Number.isNaN(t) && t < cutoff) return false;
-    }
     if (minScore > 0 || minWooded > 0) {
       const row = indexById.get(e.parcel_id);
       if (!row) return false;
@@ -1298,8 +1354,23 @@ function renderActivityList() {
       if (minWooded > 0 && (row.wooded_acres ?? 0) < minWooded) return false;
     }
     return true;
+  };
+
+  const transferEvents = typeFilter === "delinquent" ? [] : activityEvents.filter((e) => {
+    if ((TYPE_BUCKET[e.event_type] ?? "other") !== "transfer") return false;
+    if (!passesCommon(e)) return false;
+    if (cutoff && e.event_date) {
+      const t = Date.parse(e.event_date);
+      if (!Number.isNaN(t) && t < cutoff) return false;
+    }
+    return true;
   });
-  filtered.sort((a, b) => (b.event_date ?? "").localeCompare(a.event_date ?? ""));
+  // Delinquency is a persistent condition, not a dated event -- it isn't
+  // gated by the recency pill (matches computeMapActiveParcels).
+  const delinquentEvents = typeFilter === "transfer" ? [] : currentDelinquencyPseudoEvents().filter(passesCommon);
+
+  const filtered = [...transferEvents, ...delinquentEvents];
+  filtered.sort((a, b) => (b.event_date ?? b.detected_at ?? "").localeCompare(a.event_date ?? a.detected_at ?? ""));
 
   document.querySelector("#activity-summary").textContent =
     `${filtered.length} event${filtered.length === 1 ? "" : "s"} · ${new Set(filtered.map((e) => e.parcel_id)).size} parcels`;
@@ -1324,6 +1395,8 @@ function renderActivityList() {
   document.querySelector("#activity-freshness").innerHTML = [...bySource.entries()]
     .map(([sid, ts]) => `<div>${SOURCE_LABELS[sid] ?? sid} · updated ${ts ? ts.slice(0, 10) : "—"}</div>`)
     .join("");
+
+  buildActivityIndicatorLayer(); // keep the map's active/recent dot set synced to these same filters
 }
 
 // --- Market panel: Ohio Timber Price Report + Wayne NF Cut & Sold. Kept
@@ -1403,19 +1476,84 @@ function fmtNum(v) {
   return v == null ? "—" : Math.round(v).toLocaleString();
 }
 
-// --- Map indicator: an independent visual treatment (small halo dot), never
-// a replacement for the Timber Score fill color. ---
+// --- Map indicator: "which parcels have a meaningful CURRENT/RECENT
+// signal" -- deliberately NOT the same set as "which parcels have ever had
+// any activity event" (that would turn the map into a history-density
+// layer). An independent visual treatment (small dot), never a
+// replacement for the Timber Score fill color.
+//
+// - Transfers/sales are point-in-time: shown only within the active
+//   recency pill's window (default 90 days; "All" shows full history, an
+//   explicit user choice rather than the default).
+// - Tax delinquency is a persistent condition: shown whenever
+//   activity_current_state still says active=1 for that parcel, REGARDLESS
+//   of the recency pill (a delinquency doesn't "expire" after 90 days just
+//   because nothing new happened) -- it only disappears once actually
+//   cleared. A delinquency whose amount changed within the last 30 days
+//   gets a distinct color (more specific/urgent than steady-state).
+// Recomputed on every Activity filter change so the map and feed stay
+// synchronized, per product feedback. ---
+const FIPS_TO_COUNTY = { "39157": "Tuscarawas", "39075": "Holmes", "39031": "Coshocton" };
+function countyForParcelId(parcelId) {
+  return FIPS_TO_COUNTY[parcelId?.split("-")[0]] ?? null;
+}
+
+function computeMapActiveParcels() {
+  const recency = document.querySelector("#activity-recency-pills .pill-toggle.active")?.dataset.recency ?? "90";
+  const typeFilter = document.querySelector("#activity-type-pills .pill-toggle.active")?.dataset.type ?? "all";
+  const countyFilter = document.querySelector("#activity-county-pills .pill-toggle.active")?.dataset.county ?? "all";
+  const minScore = Number(document.querySelector("#activity-min-score")?.value || 0);
+  const minWooded = Number(document.querySelector("#activity-min-wooded")?.value || 0);
+  const cutoff = recency === "all" ? null : Date.now() - Number(recency) * 86400000;
+
+  const passesContext = (parcelId, county) => {
+    if (countyFilter !== "all" && county !== countyFilter) return false;
+    if (minScore > 0 || minWooded > 0) {
+      const row = indexById.get(parcelId);
+      if (!row) return false;
+      if (minScore > 0 && (row.timber_score ?? 0) < minScore) return false;
+      if (minWooded > 0 && (row.wooded_acres ?? 0) < minWooded) return false;
+    }
+    return true;
+  };
+
+  const kindByParcel = new Map(); // priority: delinquent_changed > transfer > delinquent
+
+  if (typeFilter === "all" || typeFilter === "delinquent") {
+    for (const [parcelId] of delinquentActiveByParcel) {
+      const row = indexById.get(parcelId);
+      if (!row || !passesContext(parcelId, countyForParcelId(parcelId))) continue;
+      kindByParcel.set(parcelId, recentlyChangedDelinquentParcels.has(parcelId) ? "delinquent_changed" : "delinquent");
+    }
+  }
+  if (typeFilter === "all" || typeFilter === "transfer") {
+    for (const e of activityEvents) {
+      if ((TYPE_BUCKET[e.event_type] ?? "other") !== "transfer") continue;
+      if (cutoff) {
+        const t = Date.parse(e.event_date);
+        if (Number.isNaN(t) || t < cutoff) continue;
+      }
+      if (!passesContext(e.parcel_id, e.county)) continue;
+      if (kindByParcel.get(e.parcel_id) !== "delinquent_changed") kindByParcel.set(e.parcel_id, "transfer");
+    }
+  }
+  return kindByParcel;
+}
+
 function buildActivityIndicatorLayer() {
-  const features = [...activityByParcel.keys()]
-    .map((pid) => indexById.get(pid))
-    .filter((row) => row && row.centroid_lon != null)
-    .map((row) => ({
+  const kindByParcel = computeMapActiveParcels();
+  const features = [...kindByParcel.entries()]
+    .map(([pid, kind]) => [indexById.get(pid), kind])
+    .filter(([row]) => row && row.centroid_lon != null)
+    .map(([row, kind]) => ({
       type: "Feature",
-      properties: { parcel_id: row.parcel_id },
+      properties: { parcel_id: row.parcel_id, kind },
       geometry: { type: "Point", coordinates: [row.centroid_lon, row.centroid_lat] },
     }));
   const src = map.getSource("activity-indicator");
   if (src) src.setData({ type: "FeatureCollection", features });
+  const summaryEl = document.querySelector("#activity-map-summary");
+  if (summaryEl) summaryEl.textContent = `${features.length} parcel${features.length === 1 ? "" : "s"} active/recent`;
 }
 
 document.querySelectorAll(".signals-tab").forEach((tab) => {
