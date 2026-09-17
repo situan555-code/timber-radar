@@ -34,18 +34,27 @@ export const DAY_MS = 86400000;
  * recency window ending now?
  *
  * `days === null` means "no cutoff" (the pill's "All" option) -- always
- * passes, historical date included. Otherwise the event's `event_date`
- * MUST parse to a valid date and fall within the window: a transfer with a
+ * passes, historical date included, WITH NO upper-bound check either: "All"
+ * is deliberately left as-is here (an undated or future-stamped record
+ * showing up under "All" is a data-quality question for that record, not
+ * something this function should silently filter). That's a conscious
+ * choice, not an oversight -- revisit it only as an intentional decision to
+ * also suppress those records under "All", not as an incidental side
+ * effect of the upper-bound check below. Otherwise the event's
+ * `event_date` MUST parse to a valid date and fall within the window: a
  * missing or malformed date is excluded from ANY finite window rather than
  * silently passing through, so the map and the feed can't disagree on
  * malformed data the way they used to when the feed's guard
  * (`if (cutoff && e.event_date)`) let an undated event through that the
- * map's `Date.parse` check would have dropped.
+ * map's `Date.parse` check would have dropped. Likewise a future-dated
+ * event (`t > now`) is excluded from any finite window -- a transfer dated
+ * tomorrow is not "within the last N days" no matter how small N is.
  */
 export function transferIsWithinWindow(event, days, now = Date.now()) {
   if (days == null) return true;
   const t = Date.parse(event?.event_date);
   if (Number.isNaN(t)) return false;
+  if (t > now) return false;
   return t >= now - days * DAY_MS;
 }
 
@@ -69,11 +78,16 @@ export function activityChangeObservedAt(event) {
   return null;
 }
 
-/** Did we observe this event/change within the last `days` days? */
+/**
+ * Did we observe this event/change within the last `days` days? A
+ * future-dated observation (`t > now`) is excluded -- clock skew or a bad
+ * timestamp in the source data must not manifest as "changed recently".
+ */
 export function changeObservedWithinWindow(event, days, now = Date.now()) {
   if (days == null) return false;
   const t = activityChangeObservedAt(event);
   if (t == null) return false;
+  if (t > now) return false;
   return t >= now - days * DAY_MS;
 }
 

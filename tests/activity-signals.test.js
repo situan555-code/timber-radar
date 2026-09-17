@@ -43,6 +43,24 @@ test("transferIsWithinWindow: malformed event_date is excluded under a finite wi
   assert.equal(transferIsWithinWindow(e, 90, NOW), false);
 });
 
+// Upper-bound protection: a future-dated transfer must not count as
+// "within the last N days" under any finite window, regardless of how
+// close to `now` it is.
+test("transferIsWithinWindow: future-dated transfer is excluded under a finite window", () => {
+  const tomorrow = new Date(NOW + 1 * 86400000).toISOString().slice(0, 10);
+  assert.equal(transferIsWithinWindow({ event_date: tomorrow }, 90, NOW), false);
+  const farFuture = new Date(NOW + 365 * 86400000).toISOString().slice(0, 10);
+  assert.equal(transferIsWithinWindow({ event_date: farFuture }, 90, NOW), false);
+});
+
+// "All" (days=null) is intentionally left unbounded on both ends -- this
+// locks in that decision as documented behavior rather than an accident of
+// the upper-bound check only being wired into the finite-window branch.
+test("transferIsWithinWindow: future-dated transfer still passes when days=null (\"All\")", () => {
+  const farFuture = new Date(NOW + 365 * 86400000).toISOString().slice(0, 10);
+  assert.equal(transferIsWithinWindow({ event_date: farFuture }, null, NOW), true);
+});
+
 test("transferIsWithinWindow: missing event_date still passes when days=null", () => {
   assert.equal(transferIsWithinWindow({ event_date: null }, null, NOW), true);
 });
@@ -80,6 +98,14 @@ test("changeObservedWithinWindow: a delinquency-change event lacking detected_at
 test("changeObservedWithinWindow: uses last_seen_at when detected_at is absent", () => {
   const e = { last_seen_at: new Date(days(5)).toISOString() };
   assert.equal(changeObservedWithinWindow(e, 30, NOW), true);
+});
+
+// Upper-bound protection: a future-dated observation (clock skew, a bad
+// detected_at written by some future run) must not read as "changed
+// recently".
+test("changeObservedWithinWindow: future-dated detected_at is excluded", () => {
+  const e = { detected_at: new Date(NOW + 5 * 86400000).toISOString() };
+  assert.equal(changeObservedWithinWindow(e, 30, NOW), false);
 });
 
 test("buildRecentlyChangedDelinquentSet: only includes parcels with a recent, resolvable observation time", () => {
